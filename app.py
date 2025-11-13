@@ -29,6 +29,7 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, or_
 from flask_wtf import CSRFProtect
 from flask_wtf.csrf import generate_csrf
+from markupsafe import Markup
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -667,7 +668,13 @@ def render_page(body_template, **context):
 
 @app.context_processor
 def inject_csrf():
-    return {"csrf_token": generate_csrf}
+    def csrf_field():
+        token = generate_csrf()
+        return Markup(
+            f'<input type="hidden" name="csrf_token" value="{token}">'
+        )
+
+    return {"csrf_token": csrf_field}
 
 
 @app.route("/initdb")
