@@ -25,13 +25,30 @@ Workflow-, Logging- und Kollaborationslogik nachbildet.
 - Dashboard filters (status, priority, department, text) and pagination to slice
   large backlogs. / Dashboard-Filter (Status, Priorität, Abteilung, Text) plus
   Pagination, um große Backlogs bequem zu durchsuchen.
+- Extended filtering (creator/responsible/risk/favorites) plus Kanban board and
+  CSV export options. / Erweiterte Filter (Antragsteller/Verantwortlicher/
+  Risiko/Favoriten) sowie Kanban-Board und CSV-Export.
 - Automatic follow-up CIP creation when an implementation is not effective. /
   Automatische Folge-CIPs, wenn eine Maßnahme nicht wirksam ist.
 - Workflow history tracking with `CIPMeasureHistory`. / Workflow-Historie mit
   `CIPMeasureHistory`.
+- SLA monitoring, escalation workflows, risk scoring, and saving projections so
+  overdue items are highlighted immediately. / SLA-Überwachung,
+  Eskalationsabläufe, Risikobewertung und Einsparungsprognosen sorgen für eine
+  sofortige Sichtbarkeit überfälliger Maßnahmen.
 - Task and request module so teams can assign work, share updates, and respond
   inline. / Aufgaben- und Anfrage-Modul, damit Teams Arbeit zuweisen, Updates
   teilen und direkt antworten können.
+- Attachment uploads, rich templates, threaded comments, and in-app
+  notifications keep every artifact inside the CIP record. / Dateiuploads,
+  mächtige Vorlagen, Kommentarverläufe und In-App-Benachrichtigungen halten
+  alle Artefakte direkt im CIP-Datensatz.
+- Meeting agenda tracking, managerial/department access rules with delegate
+  support, KPI dashboards, HTML reports, and a lightweight REST API ensure the
+  app fits broader governance flows. / Besprechungsagenda,
+  Manager-/Abteilungszugriffe mit Vertreterregelung, KPI-Dashboards,
+  HTML-Berichte und eine schlanke REST-API integrieren die App in bestehende
+  Governance-Abläufe.
 - Global audit log that lists every workflow or task action for transparency. /
   Globales Audit-Log, das jeden Workflow- oder Aufgaben-Schritt dokumentiert.
 - **Self-service onboarding**: public registration, email confirmation tokens,
@@ -76,10 +93,18 @@ Schema zurückgesetzt und folgende Demo-Nutzer geladen:
 | `/cip/new` | Create a new CIP (CREATOR or ADMIN) / Neuen CIP anlegen (CREATOR oder ADMIN). |
 | `/cip/<id>/edit` | Edit a DRAFT CIP before reporting / Entwurfs-CIP vor dem Melden bearbeiten. |
 | `/cip/<id>` | CIP detail view with workflow actions and tasks / CIP-Details mit Workflow-Aktionen und Aufgaben. |
+| `/board` | Kanban board grouped by status / Kanban-Board nach Status. |
 | `/kpi` | KPI cards for open counts, close-time averages, and department mix / KPI-Karten für offene Vorgänge, Durchlaufzeit und Abteilungsanteile. |
+| `/reports` | Monthly/category summaries / Monats- und Kategorienübersichten. |
+| `/export/cip` | CSV export aligned with dashboard filters / CSV-Export gemäß Dashboard-Filtern. |
 | `/logs` | System log with the latest 200 entries / Systemprotokoll mit den letzten 200 Einträgen. |
+| `/notifications` | Personal notifications inbox / Persönlicher Benachrichtigungsbereich. |
+| `/meetings` | CIP meeting overview and detail screens / Übersicht und Details zu CIP-Meetings. |
 | `/admin` | Admin area for reference data and users / Verwaltungsbereich für Stammdaten und Benutzer. |
 | `/admin/approvals` | Queue where admins approve confirmed users / Warteschlange, in der Admins bestätigte Nutzer freigeben. |
+| `/admin/sla` | SLA rules / SLA-Regeln. |
+| `/admin/templates` | Manage problem-description templates / Vorlagen verwalten. |
+| `/admin/audit` | Latest audit log entries / Neueste Audit-Logs. |
 | `/initdb` | Reset the database and demo data / Datenbank und Demodaten zurücksetzen. |
 
 ## Self-service onboarding / Selbstregistrierung

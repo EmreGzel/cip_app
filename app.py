@@ -1,3 +1,5 @@
+import csv
+import io
 import os
 import secrets
 from datetime import datetime, timedelta
@@ -5,11 +7,14 @@ from functools import wraps
 
 from flask import (
     Flask,
+    Response,
     abort,
     flash,
+    jsonify,
     redirect,
     render_template_string,
     request,
+    send_from_directory,
     url_for,
 )
 from flask_login import (
@@ -25,6 +30,7 @@ from sqlalchemy import func, or_
 from flask_wtf import CSRFProtect
 from flask_wtf.csrf import generate_csrf
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 
 
 app = Flask(__name__)
@@ -33,6 +39,10 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "DATABASE_URL", "sqlite:///cip.db"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["UPLOAD_FOLDER"] = os.environ.get(
+    "CIP_UPLOAD_FOLDER", os.path.join(app.root_path, "uploads")
+)
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
 ADMIN_APPROVER_EMAIL = os.environ.get("CIP_APPROVER_EMAIL", "emre.guzel@fkt.com.tr")
 
@@ -56,6 +66,10 @@ WORKFLOW_STATUSES = [
 
 THEME_TYPES = ["CORRECTION", "OPTIMIZATION"]
 EFFECTIVENESS_STATUSES = ["UNKNOWN", "EFFECTIVE", "NOT_EFFECTIVE"]
+RISK_SCALE = [1, 2, 3, 4, 5]
+PRIORITY_CLASSES = {"LOW": "success", "HIGH": "danger"}
+API_TOKEN = os.environ.get("CIP_API_TOKEN", "demo-token")
+CURRENCIES = ["EUR", "TRY"]
 TASK_STATUS_LABELS = {
     "OPEN": "Open / Offen",
     "IN_PROGRESS": "In Progress / In Bearbeitung",
@@ -101,9 +115,22 @@ STATUS_TIMESTAMPS = {
     "CANCELLED": "closed_at",
 }
 
+STATUS_NOTIFICATION_RULES = {
+    "REPORTED": lambda measure: [measure.responsible],
+    "SOLUTION_PROPOSED": lambda measure: [measure.creator],
+    "SOLUTION_ACCEPTED": lambda measure: [measure.responsible],
+    "IMPLEMENTED": lambda measure: [measure.creator],
+    "CLOSED_EFFECTIVE": lambda measure: [measure.creator, measure.responsible],
+    "CLOSED_NOT_EFFECTIVE": lambda measure: [measure.creator, measure.responsible],
+}
+
 
 def _is_admin(user):
     return user.role.name == "ADMIN"
+
+
+def _is_manager(user):
+    return user.role.name == "MANAGER"
 
 
 def _is_creator(user, measure):
@@ -111,13 +138,36 @@ def _is_creator(user, measure):
 
 
 def _is_responsible(user, measure):
-    return measure is not None and measure.responsible_id == user.id
+    return _handles_measure(user, measure)
+
+
+def _handles_measure(user, measure):
+    if measure is None:
+        return False
+    if measure.responsible_id == user.id:
+        return True
+    if user.delegate_id and measure.responsible_id == user.delegate_id:
+        return True
+    return False
+
+
+def current_user_is_allowed(measure):
+    if not current_user.is_authenticated:
+        return False
+    return _handles_measure(current_user, measure)
 
 
 def _can_view_measure(user, measure):
-    return measure is not None and (
-        _is_admin(user) or _is_creator(user, measure) or _is_responsible(user, measure)
-    )
+    if measure is None:
+        return False
+    if _is_admin(user) or _is_creator(user, measure) or _is_responsible(user, measure):
+        return True
+    if _is_manager(user) and user.department_id:
+        return user.department_id in (
+            measure.reporting_department_id,
+            measure.responsible_department_id,
+        )
+    return False
 
 
 PERMISSION_MATRIX = {
@@ -153,6 +203,16 @@ PERMISSION_MATRIX = {
     "create_task": lambda user, measure=None, **ctx: _can_view_measure(user, measure),
     "update_task_status": lambda user, task=None, **ctx: task
     and (user.role.name == "ADMIN" or task.assigned_to_id == user.id),
+    "comment": lambda user, measure=None, **ctx: _can_view_measure(user, measure),
+    "manage_attachments": lambda user, measure=None, **ctx: _can_view_measure(user, measure),
+    "download_attachment": lambda user, measure=None, **ctx: _can_view_measure(user, measure),
+    "favorite": lambda user, measure=None, **ctx: _can_view_measure(user, measure),
+    "escalate": lambda user, measure=None, **ctx: measure
+    and (_is_admin(user) or _is_responsible(user, measure) or _is_manager(user)),
+    "manage_sla": lambda user, **ctx: _is_admin(user),
+    "manage_templates": lambda user, **ctx: _is_admin(user),
+    "view_audit": lambda user, **ctx: _is_admin(user),
+    "view_board": lambda user, **ctx: user.is_authenticated,
 }
 
 
@@ -181,6 +241,8 @@ class User(UserMixin, db.Model):
     approved_by_id = db.Column(db.Integer, db.ForeignKey("user.id"))
     approved_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    department_id = db.Column(db.Integer, db.ForeignKey("department.id"))
+    delegate_id = db.Column(db.Integer, db.ForeignKey("user.id"))
 
     role = db.relationship("Role", backref=db.backref("users", lazy=True))
     approved_by = db.relationship(
@@ -188,6 +250,13 @@ class User(UserMixin, db.Model):
         remote_side=[id],
         foreign_keys=[approved_by_id],
         backref=db.backref("approved_users", lazy=True),
+    )
+    department = db.relationship("Department", backref=db.backref("members", lazy=True))
+    delegate = db.relationship(
+        "User",
+        remote_side=[id],
+        foreign_keys=[delegate_id],
+        backref=db.backref("delegated_users", lazy=True),
     )
 
     @property
@@ -270,6 +339,18 @@ class CIPMeasure(db.Model):
     effectiveness_comment = db.Column(db.Text)
 
     parent_measure_id = db.Column(db.Integer, db.ForeignKey("cip_measure.id"))
+    escalated_to_id = db.Column(db.Integer, db.ForeignKey("user.id"))
+    escalated_at = db.Column(db.DateTime)
+    escalation_reason = db.Column(db.Text)
+
+    risk_impact = db.Column(db.Integer)
+    risk_probability = db.Column(db.Integer)
+    safety_related = db.Column(db.Boolean, default=False)
+    customer_impact = db.Column(db.Boolean, default=False)
+
+    expected_saving_per_year = db.Column(db.Float)
+    saving_currency = db.Column(db.String(8))
+    actual_saving_first_year = db.Column(db.Float)
 
     creator = db.relationship(
         "User", foreign_keys=[creator_id], backref=db.backref("created_measures", lazy=True)
@@ -297,6 +378,31 @@ class CIPMeasure(db.Model):
         remote_side=[id],
         backref=db.backref("children", lazy=True),
     )
+    escalated_to = db.relationship("User", foreign_keys=[escalated_to_id])
+
+    @property
+    def risk_score(self):
+        if self.risk_impact and self.risk_probability:
+            return self.risk_impact * self.risk_probability
+        return None
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "status": self.status,
+            "priority": self.priority.name if self.priority else None,
+            "reporting_department": self.reporting_department.name
+            if self.reporting_department
+            else None,
+            "responsible_department": self.responsible_department.name
+            if self.responsible_department
+            else None,
+            "creator": self.creator.username if self.creator else None,
+            "responsible": self.responsible.username if self.responsible else None,
+            "risk_score": self.risk_score,
+            "expected_saving_per_year": self.expected_saving_per_year,
+        }
 
 
 class CIPMeasureHistory(db.Model):
@@ -349,6 +455,105 @@ class CIPTask(db.Model):
     )
 
 
+class SLARule(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    from_status = db.Column(db.String(32), nullable=False)
+    to_status = db.Column(db.String(32), nullable=False)
+    max_days = db.Column(db.Integer, nullable=False)
+
+
+class CIPAttachment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    measure_id = db.Column(db.Integer, db.ForeignKey("cip_measure.id"), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    filepath = db.Column(db.String(512), nullable=False)
+    uploaded_by_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    measure = db.relationship(
+        "CIPMeasure", backref=db.backref("attachments", lazy=True, cascade="all, delete-orphan")
+    )
+    uploaded_by = db.relationship("User")
+
+
+class CIPTemplate(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(128), nullable=False)
+    description = db.Column(db.Text)
+    content = db.Column(db.Text)
+
+
+class CIPComment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    measure_id = db.Column(db.Integer, db.ForeignKey("cip_measure.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    text = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    measure = db.relationship(
+        "CIPMeasure", backref=db.backref("comments_list", lazy=True, cascade="all, delete-orphan")
+    )
+    user = db.relationship("User")
+
+
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    message = db.Column(db.String(255), nullable=False)
+    link = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    read = db.Column(db.Boolean, default=False, nullable=False)
+
+    user = db.relationship("User", backref=db.backref("notifications", lazy=True))
+
+
+class CIPMeeting(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    date = db.Column(db.Date, nullable=False)
+    notes = db.Column(db.Text)
+
+
+class CIPMeetingItem(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("cip_meeting.id"), nullable=False)
+    measure_id = db.Column(db.Integer, db.ForeignKey("cip_measure.id"), nullable=False)
+    discussion_notes = db.Column(db.Text)
+
+    meeting = db.relationship(
+        "CIPMeeting", backref=db.backref("items", lazy=True, cascade="all, delete-orphan")
+    )
+    measure = db.relationship(
+        "CIPMeasure", backref=db.backref("meetings", lazy=True, cascade="all, delete-orphan")
+    )
+
+
+class CIPFavorite(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    measure_id = db.Column(db.Integer, db.ForeignKey("cip_measure.id"), nullable=False)
+
+    user = db.relationship(
+        "User", backref=db.backref("favorites", lazy=True, cascade="all, delete-orphan")
+    )
+    measure = db.relationship("CIPMeasure", backref=db.backref("favorite_entries", lazy=True))
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "measure_id", name="uq_favorite_user_measure"),
+    )
+
+
+class AuditLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
+    action = db.Column(db.String(64), nullable=False)
+    measure_id = db.Column(db.Integer, db.ForeignKey("cip_measure.id"))
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    details = db.Column(db.Text)
+
+    user = db.relationship("User")
+    measure = db.relationship("CIPMeasure")
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -388,6 +593,7 @@ BASE_TEMPLATE = """
         .card { background: #fff; padding: 1rem; border: 1px solid #ddd; flex: 1 1 300px; }
         .danger { color: #b22222; }
         .success { color: #0a7d00; }
+        .warning { color: #c97a00; }
     </style>
 </head>
 <body>
@@ -401,14 +607,18 @@ BASE_TEMPLATE = """
         <nav>
             {% if current_user.is_authenticated %}
                 <a href=\"{{ url_for('dashboard') }}\">Dashboard / Übersicht</a>
+                <a href=\"{{ url_for('board') }}\">Kanban Board</a>
                 {% if can_do(current_user, 'create_cip') %}
                     <a href=\"{{ url_for('new_cip') }}\">New CIP / Neuer CIP</a>
                 {% endif %}
+                <a href=\"{{ url_for('meetings') }}\">Meetings</a>
                 {% if can_do(current_user, 'admin') %}
                     <a href=\"{{ url_for('admin_panel') }}\">Admin / Verwaltung</a>
                 {% endif %}
+                <a href=\"{{ url_for('reports') }}\">Reports</a>
                 <a href=\"{{ url_for('kpi_dashboard') }}\">KPI</a>
                 <a href=\"{{ url_for('view_logs') }}\">Logs / Protokolle</a>
+                <a href=\"{{ url_for('notifications') }}\">Notifications ({{ unread_notification_count }})</a>
                 <a href=\"{{ url_for('logout') }}\">Logout / Abmelden</a>
             {% else %}
                 <a href=\"{{ url_for('login') }}\">Login / Anmelden</a>
@@ -436,6 +646,11 @@ BASE_TEMPLATE = """
 def render_page(body_template, **context):
     context.setdefault("bilingual", bilingual)
     body = render_template_string(body_template, **context)
+    unread_notifications = 0
+    if current_user.is_authenticated:
+        unread_notifications = Notification.query.filter_by(
+            user_id=current_user.id, read=False
+        ).count()
     return render_template_string(
         BASE_TEMPLATE,
         body=body,
@@ -446,6 +661,7 @@ def render_page(body_template, **context):
         TASK_STATUS_LABELS=TASK_STATUS_LABELS,
         bilingual=bilingual,
         can_do=can_do,
+        unread_notification_count=unread_notifications,
         **context
     )
 
@@ -460,7 +676,10 @@ def init_db():
     db.drop_all()
     db.create_all()
 
-    roles = {name: Role(name=name) for name in ["ADMIN", "CREATOR", "RESPONSIBLE"]}
+    roles = {
+        name: Role(name=name)
+        for name in ["ADMIN", "CREATOR", "RESPONSIBLE", "MANAGER"]
+    }
     db.session.add_all(roles.values())
 
     departments = [
@@ -492,6 +711,7 @@ def init_db():
             email="alice@example.com",
             password=generate_password_hash("alice"),
             role=roles["CREATOR"],
+            department=departments[0],
             is_email_confirmed=True,
             requires_approval=False,
             approved_at=now,
@@ -502,6 +722,18 @@ def init_db():
             email="bob@example.com",
             password=generate_password_hash("bob"),
             role=roles["RESPONSIBLE"],
+            department=departments[1],
+            is_email_confirmed=True,
+            requires_approval=False,
+            approved_at=now,
+            created_at=now,
+        ),
+        User(
+            username="marta",
+            email="manager@example.com",
+            password=generate_password_hash("manager"),
+            role=roles["MANAGER"],
+            department=departments[0],
             is_email_confirmed=True,
             requires_approval=False,
             approved_at=now,
@@ -721,47 +953,24 @@ def logout():
 @login_required
 def dashboard():
     page = request.args.get("page", 1, type=int)
-    status_filter = (request.args.get("status") or "").strip().upper()
-    priority_filter = request.args.get("priority") or ""
-    department_filter = request.args.get("department") or ""
-    text_filter = (request.args.get("q") or "").strip()
-
-    query = CIPMeasure.query
-    if current_user.role.name == "ADMIN":
-        pass
-    elif current_user.role.name == "CREATOR":
-        query = query.filter_by(creator_id=current_user.id)
-    else:
-        query = query.filter_by(responsible_id=current_user.id)
-
-    if status_filter and status_filter in WORKFLOW_STATUSES:
-        query = query.filter(CIPMeasure.status == status_filter)
-    if priority_filter.isdigit():
-        query = query.filter(CIPMeasure.priority_id == int(priority_filter))
-    if department_filter.isdigit():
-        query = query.filter(
-            CIPMeasure.reporting_department_id == int(department_filter)
-        )
-    if text_filter:
-        like = f"%{text_filter}%"
-        query = query.filter(
-            or_(
-                CIPMeasure.title.ilike(like),
-                CIPMeasure.problem_description.ilike(like),
-            )
-        )
-
+    filters = _extract_dashboard_filters()
+    query = _apply_measure_filters(_base_measure_query(), filters)
     pagination = query.order_by(CIPMeasure.created_at.desc()).paginate(
         page=page, per_page=10, error_out=False
     )
     priorities = Priority.query.order_by(Priority.name).all()
     departments = Department.query.order_by(Department.name).all()
-    filters = dict(
-        status=status_filter,
-        priority=priority_filter,
-        department=department_filter,
-        q=text_filter,
-    )
+    users = User.query.order_by(User.username).all()
+    sla_rules = SLARule.query.all()
+    sla_map = {measure.id: check_sla(measure, sla_rules) for measure in pagination.items}
+    favorite_ids = _favorite_ids_for_user(current_user)
+    due_hints = {measure.id: _due_date_hint(measure) for measure in pagination.items}
+    savings_summary = {
+        "expected": sum((measure.expected_saving_per_year or 0) for measure in pagination.items),
+        "actual": sum((measure.actual_saving_first_year or 0) for measure in pagination.items),
+    }
+    request_args = request.args.to_dict(flat=False)
+    export_url = url_for("export_cip", **request_args)
     return render_page(
         """
         <h1>Dashboard / Übersicht</h1>
@@ -769,28 +978,45 @@ def dashboard():
             <div class=\"flex\">
                 <div>
                     <label>Status</label>
-                    <select name=\"status\">
-                        <option value=\"\">All / Alle</option>
+                    <select name=\"status\" multiple size=\"{{ WORKFLOW_STATUSES|length }}\">
                         {% for status in WORKFLOW_STATUSES %}
-                            <option value=\"{{ status }}\" {% if filters.status == status %}selected{% endif %}>{{ status }}</option>
+                            <option value=\"{{ status }}\" {% if status in filters.statuses %}selected{% endif %}>{{ status }}</option>
                         {% endfor %}
                     </select>
                 </div>
                 <div>
                     <label>Priority / Priorität</label>
-                    <select name=\"priority\">
+                    <select name=\"priority_id\">
                         <option value=\"\">All / Alle</option>
                         {% for priority in priorities %}
-                            <option value=\"{{ priority.id }}\" {% if filters.priority|int == priority.id %}selected{% endif %}>{{ priority.name }}</option>
+                            <option value=\"{{ priority.id }}\" {% if filters.priority_id == priority.id %}selected{% endif %}>{{ priority.name }}</option>
                         {% endfor %}
                     </select>
                 </div>
                 <div>
                     <label>Department / Abteilung</label>
-                    <select name=\"department\">
+                    <select name=\"department_id\">
                         <option value=\"\">All / Alle</option>
                         {% for department in departments %}
-                            <option value=\"{{ department.id }}\" {% if filters.department|int == department.id %}selected{% endif %}>{{ department.name }}</option>
+                            <option value=\"{{ department.id }}\" {% if filters.department_id == department.id %}selected{% endif %}>{{ department.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label>Creator / Antragsteller</label>
+                    <select name=\"creator_id\">
+                        <option value=\"\">-</option>
+                        {% for user in users %}
+                            <option value=\"{{ user.id }}\" {% if filters.creator_id == user.id %}selected{% endif %}>{{ user.username }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label>Responsible / Verantwortlicher</label>
+                    <select name=\"responsible_id\">
+                        <option value=\"\">-</option>
+                        {% for user in users %}
+                            <option value=\"{{ user.id }}\" {% if filters.responsible_id == user.id %}selected{% endif %}>{{ user.username }}</option>
                         {% endfor %}
                     </select>
                 </div>
@@ -799,43 +1025,84 @@ def dashboard():
                     <input type=\"text\" name=\"q\" value=\"{{ filters.q }}\" placeholder=\"Title or problem description / Titel oder Problembeschreibung\">
                 </div>
             </div>
+            <div class=\"flex\">
+                <div>
+                    <label>Risk score &ge;</label>
+                    <input type=\"number\" name=\"risk_min\" min=\"1\" max=\"25\" value=\"{{ filters.risk_min or '' }}\">
+                </div>
+                <div>
+                    <label><input type=\"checkbox\" name=\"favorites_only\" value=\"1\" {% if filters.favorites_only %}checked{% endif %}> Only favorites / Nur Favoriten</label>
+                </div>
+            </div>
             <div class=\"button-row\">
                 <button type=\"submit\">Apply Filters / Filter anwenden</button>
                 <a href=\"{{ url_for('dashboard') }}\">Reset / Zurücksetzen</a>
+                <a href=\"{{ export_url }}\">Export CSV</a>
             </div>
         </form>
         <p>{{ pagination.total }} CIP record(s) listed / {{ pagination.total }} CIP-Datensätze angezeigt.</p>
+        <p>{{ bilingual('Expected saving sum (mixed currencies)', 'Erwartete Einsparungssumme (gemischte Währungen)') }}: {{ '%.2f'|format(savings_summary.expected) }} | {{ bilingual('Actual', 'Tatsächlich') }}: {{ '%.2f'|format(savings_summary.actual) }}</p>
         <table>
             <tr>
                 <th>No</th>
+                <th>Fav</th>
                 <th>Title / Titel</th>
                 <th>Status / Status</th>
                 <th>Priority / Priorität</th>
+                <th>Risk</th>
                 <th>Department / Abteilung</th>
                 <th>Creator / Antragsteller</th>
                 <th>Responsible / Verantwortlicher</th>
+                <th>Due / Fällig</th>
+                <th>SLA</th>
                 <th>Created / Erstellt</th>
             </tr>
             {% for measure in pagination.items %}
-            <tr>
-                <td><a href=\"{{ url_for('view_cip', measure_id=measure.id) }}\">#{{ measure.id }}</a></td>
-                <td>{{ measure.title }}</td>
-                <td>{{ measure.status }}</td>
-                <td>{{ measure.priority.name if measure.priority else '' }}</td>
-                <td>{{ measure.reporting_department.name if measure.reporting_department else '-' }}</td>
-                <td>{{ measure.creator.username }}</td>
-                <td>{{ measure.responsible.username }}</td>
-                <td>{{ measure.created_at.strftime('%Y-%m-%d') }}</td>
-            </tr>
+                <tr>
+                    <td><a href=\"{{ url_for('view_cip', measure_id=measure.id) }}\">#{{ measure.id }}</a></td>
+                    <td>
+                        <form method=\"post\" action=\"{{ url_for('toggle_favorite', measure_id=measure.id) }}\">
+                            {{ csrf_token() }}
+                            <button type=\"submit\">{% if measure.id in favorite_ids %}★{% else %}☆{% endif %}</button>
+                        </form>
+                    </td>
+                    <td>{{ measure.title }}</td>
+                    <td>{{ measure.status }}</td>
+                    <td class=\"{{ PRIORITY_CLASSES.get((measure.priority.name if measure.priority else '')|upper, '') }}\">{{ measure.priority.name if measure.priority else '' }}</td>
+                    <td>{{ measure.risk_score or '-' }}</td>
+                    <td>{{ measure.reporting_department.name if measure.reporting_department else '-' }}</td>
+                    <td>{{ measure.creator.username }}</td>
+                    <td>{{ measure.responsible.username }}</td>
+                    <td>
+                        {{ measure.planned_due_date or '-' }}
+                        {% set hint = due_hints.get(measure.id) %}
+                        {% if hint and hint[0] %}
+                            <div class=\"{{ hint[0] }}\">{{ hint[1] }}</div>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% set sla = sla_map.get(measure.id) %}
+                        {% if sla and not sla.is_ok %}
+                            <div class=\"danger\">
+                                {% for violation in sla.violations %}
+                                    <div>{{ violation.from_status }}→{{ violation.to_status }} ({{ violation.actual_days }} / {{ violation.max_days }}d)</div>
+                                {% endfor %}
+                            </div>
+                        {% else %}
+                            OK
+                        {% endif %}
+                    </td>
+                    <td>{{ measure.created_at.strftime('%Y-%m-%d') }}</td>
+                </tr>
             {% endfor %}
         </table>
         <div class=\"button-row\">
             {% if pagination.has_prev %}
-                <a href=\"{{ url_for('dashboard', page=pagination.prev_num, status=filters.status, priority=filters.priority, department=filters.department, q=filters.q) }}\">&laquo; Prev / Zurück</a>
+                <a href=\"{{ url_for('dashboard', page=pagination.prev_num, **request_args) }}\">&laquo; Prev / Zurück</a>
             {% endif %}
             <span>Page {{ pagination.page }} / {{ pagination.pages or 1 }}</span>
             {% if pagination.has_next %}
-                <a href=\"{{ url_for('dashboard', page=pagination.next_num, status=filters.status, priority=filters.priority, department=filters.department, q=filters.q) }}\">Next / Weiter &raquo;</a>
+                <a href=\"{{ url_for('dashboard', page=pagination.next_num, **request_args) }}\">Next / Weiter &raquo;</a>
             {% endif %}
         </div>
         """,
@@ -843,7 +1110,563 @@ def dashboard():
         priorities=priorities,
         departments=departments,
         filters=filters,
+        users=users,
+        sla_map=sla_map,
+        favorite_ids=favorite_ids,
+        due_hints=due_hints,
+        savings_summary=savings_summary,
+        export_url=export_url,
+        PRIORITY_CLASSES=PRIORITY_CLASSES,
+        request_args=request_args,
     )
+
+
+@app.route("/board")
+@login_required
+def board():
+    measures = _base_measure_query().all()
+    board_statuses = [
+        "DRAFT",
+        "REPORTED",
+        "SOLUTION_PROPOSED",
+        "SOLUTION_ACCEPTED",
+        "IMPLEMENTED",
+        "CLOSED_EFFECTIVE",
+        "CLOSED_NOT_EFFECTIVE",
+    ]
+    grouped = {status: [] for status in board_statuses}
+    for measure in measures:
+        if measure.status in grouped:
+            grouped[measure.status].append(
+                dict(
+                    measure=measure,
+                    age=(datetime.utcnow() - measure.created_at).days,
+                )
+            )
+    return render_page(
+        """
+        <h1>Kanban Board</h1>
+        <div class=\"flex\">
+            {% for status in board_statuses %}
+                <div class=\"card\" style=\"flex:1 1 280px\">
+                    <h3>{{ status }}</h3>
+                    {% for entry in grouped[status] %}
+                        <div style=\"border:1px solid #ddd; margin-bottom:0.5rem; padding:0.5rem; background:#fafafa\">
+                            <strong>#{{ entry.measure.id }} - {{ entry.measure.title }}</strong>
+                            <div>{{ entry.measure.reporting_department.name if entry.measure.reporting_department else '-' }}</div>
+                            <div>{{ entry.measure.priority.name if entry.measure.priority else '' }}</div>
+                            <div>{{ bilingual('Due', 'Fällig') }}: {{ entry.measure.planned_due_date or '-' }}</div>
+                            <div>{{ bilingual('Age', 'Alter') }}: {{ entry.age }} {{ bilingual('day(s)', 'Tag(e)') }}</div>
+                        </div>
+                    {% else %}
+                        <p>{{ bilingual('No records', 'Keine Einträge') }}</p>
+                    {% endfor %}
+                </div>
+            {% endfor %}
+        </div>
+        <p>{{ bilingual('Drag-and-drop moves will call /cip/<id>/move soon.', 'Drag-and-Drop-Änderungen rufen bald /cip/<id>/move auf.') }}</p>
+        """,
+        grouped=grouped,
+        board_statuses=board_statuses,
+    )
+
+
+@app.post("/cip/<int:measure_id>/move")
+@login_required
+def move_cip(measure_id):
+    measure = CIPMeasure.query.get_or_404(measure_id)
+    if not can_do(current_user, "view_measure", measure=measure):
+        abort(403)
+    target_status = request.form.get("status")
+    record_log(
+        "KANBAN_MOVE_ATTEMPT",
+        bilingual(
+            f"Requested move of #{measure.id} to {target_status}",
+            f"Verschiebung von #{measure.id} nach {target_status} angefragt",
+        ),
+        measure,
+    )
+    flash(
+        bilingual(
+            "Drag-and-drop API placeholder active; no change applied.",
+            "Drag-and-Drop-API-Platzhalter aktiv; keine Änderung durchgeführt.",
+        )
+    )
+    return redirect(url_for("board"))
+
+
+@app.post("/favorites/<int:measure_id>/toggle")
+@login_required
+def toggle_favorite(measure_id):
+    measure = CIPMeasure.query.get_or_404(measure_id)
+    if not can_do(current_user, "favorite", measure=measure):
+        abort(403)
+    favorite = CIPFavorite.query.filter_by(
+        user_id=current_user.id, measure_id=measure.id
+    ).first()
+    if favorite:
+        db.session.delete(favorite)
+        message = bilingual("Favorite removed", "Favorit entfernt")
+    else:
+        db.session.add(CIPFavorite(user_id=current_user.id, measure_id=measure.id))
+        message = bilingual("Favorite added", "Favorit hinzugefügt")
+    db.session.commit()
+    flash(message)
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.post("/cip/<int:measure_id>/comment")
+@login_required
+def add_comment(measure_id):
+    measure = CIPMeasure.query.get_or_404(measure_id)
+    if not can_do(current_user, "comment", measure=measure):
+        abort(403)
+    text = (request.form.get("text") or "").strip()
+    if not text:
+        flash(
+            bilingual(
+                "Comment text is required",
+                "Kommentartext ist erforderlich",
+            )
+        )
+        return redirect(url_for("view_cip", measure_id=measure.id))
+    comment = CIPComment(measure_id=measure.id, user_id=current_user.id, text=text)
+    db.session.add(comment)
+    counterpart = None
+    if current_user.id == measure.creator_id and measure.responsible:
+        counterpart = measure.responsible
+    elif current_user.id == measure.responsible_id and measure.creator:
+        counterpart = measure.creator
+    if counterpart:
+        notify(
+            counterpart,
+            bilingual(
+                f"New comment on CIP #{measure.id}",
+                f"Neuer Kommentar zu CIP #{measure.id}",
+            ),
+            url_for("view_cip", measure_id=measure.id),
+        )
+    record_log(
+        "CIP_COMMENT",
+        bilingual(
+            f"Comment added to #{measure.id}",
+            f"Kommentar zu #{measure.id} hinzugefügt",
+        ),
+        measure,
+    )
+    db.session.commit()
+    flash(
+        bilingual(
+            "Comment added",
+            "Kommentar hinzugefügt",
+        )
+    )
+    return redirect(url_for("view_cip", measure_id=measure.id))
+
+
+@app.route("/cip/<int:measure_id>/attachments", methods=["POST"])
+@login_required
+def upload_attachment(measure_id):
+    measure = CIPMeasure.query.get_or_404(measure_id)
+    if not can_do(current_user, "manage_attachments", measure=measure):
+        abort(403)
+    file = request.files.get("file")
+    if not file or not file.filename:
+        flash(
+            bilingual(
+                "Select a file to upload",
+                "Bitte eine Datei auswählen",
+            )
+        )
+        return redirect(url_for("view_cip", measure_id=measure.id))
+    filename = secure_filename(file.filename)
+    unique_name = f"{measure.id}_{int(datetime.utcnow().timestamp())}_{filename}"
+    filepath = os.path.join(app.config["UPLOAD_FOLDER"], unique_name)
+    file.save(filepath)
+    attachment = CIPAttachment(
+        measure_id=measure.id,
+        filename=filename,
+        filepath=unique_name,
+        uploaded_by_id=current_user.id,
+    )
+    db.session.add(attachment)
+    record_log(
+        "CIP_ATTACHMENT",
+        bilingual(
+            f"Attachment uploaded for #{measure.id}",
+            f"Anlage für #{measure.id} hochgeladen",
+        ),
+        measure,
+    )
+    db.session.commit()
+    flash(
+        bilingual(
+            "Attachment saved",
+            "Anhang gespeichert",
+        )
+    )
+    return redirect(url_for("view_cip", measure_id=measure.id))
+
+
+@app.route("/attachments/<int:attachment_id>/download")
+@login_required
+def download_attachment(attachment_id):
+    attachment = CIPAttachment.query.get_or_404(attachment_id)
+    if not can_do(current_user, "download_attachment", measure=attachment.measure):
+        abort(403)
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"],
+        attachment.filepath,
+        as_attachment=True,
+        download_name=attachment.filename,
+    )
+
+
+@app.post("/cip/<int:measure_id>/escalate")
+@login_required
+def escalate_cip(measure_id):
+    measure = CIPMeasure.query.get_or_404(measure_id)
+    if not can_do(current_user, "escalate", measure=measure):
+        abort(403)
+    escalated_to_id = _to_int(request.form.get("escalated_to_id"))
+    reason = (request.form.get("reason") or "").strip()
+    if not escalated_to_id or not reason:
+        flash(
+            bilingual(
+                "Escalation target and reason are required",
+                "Eskalationsziel und Grund sind erforderlich",
+            )
+        )
+        return redirect(url_for("view_cip", measure_id=measure.id))
+    measure.escalated_to_id = escalated_to_id
+    measure.escalated_at = datetime.utcnow()
+    measure.escalation_reason = reason
+    record_log(
+        "CIP_ESCALATION",
+        bilingual(
+            f"CIP #{measure.id} escalated",
+            f"CIP #{measure.id} eskaliert",
+        ),
+        measure,
+    )
+    if measure.escalated_to:
+        notify(
+            measure.escalated_to,
+            bilingual(
+                f"CIP #{measure.id} escalated to you",
+                f"CIP #{measure.id} an Sie eskaliert",
+            ),
+            url_for("view_cip", measure_id=measure.id),
+        )
+    record_audit("ESCALATE", measure, reason)
+    db.session.commit()
+    flash(
+        bilingual(
+            "Escalation recorded",
+            "Eskalation erfasst",
+        )
+    )
+    return redirect(url_for("view_cip", measure_id=measure.id))
+
+
+@app.route("/notifications")
+@login_required
+def notifications():
+    notifications = (
+        Notification.query.filter_by(user_id=current_user.id)
+        .order_by(Notification.created_at.desc())
+        .all()
+    )
+    return render_page(
+        """
+        <h1>Notifications / Benachrichtigungen</h1>
+        <table>
+            <tr><th>Message</th><th>Date</th><th>Status</th><th>Action</th></tr>
+            {% for notification in notifications %}
+                <tr>
+                    <td>{{ notification.message }}</td>
+                    <td>{{ notification.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>{{ 'Read' if notification.read else 'Unread' }} / {{ 'Gelesen' if notification.read else 'Ungelesen' }}</td>
+                    <td>
+                        <form method=\"post\" action=\"{{ url_for('open_notification', notification_id=notification.id) }}\">
+                            {{ csrf_token() }}
+                            <button type=\"submit\">{{ 'Open' if notification.link else 'Mark read' }}</button>
+                        </form>
+                    </td>
+                </tr>
+            {% else %}
+                <tr><td colspan=\"4\">{{ bilingual('No notifications', 'Keine Benachrichtigungen') }}</td></tr>
+            {% endfor %}
+        </table>
+        """,
+        notifications=notifications,
+    )
+
+
+@app.post("/notifications/<int:notification_id>/open")
+@login_required
+def open_notification(notification_id):
+    notification = Notification.query.get_or_404(notification_id)
+    if notification.user_id != current_user.id:
+        abort(403)
+    notification.read = True
+    db.session.commit()
+    if notification.link:
+        return redirect(notification.link)
+    flash(
+        bilingual(
+            "Notification marked as read",
+            "Benachrichtigung als gelesen markiert",
+        )
+    )
+    return redirect(url_for("notifications"))
+
+
+@app.route("/meetings")
+@login_required
+def meetings():
+    meetings = CIPMeeting.query.order_by(CIPMeeting.date.desc()).all()
+    return render_page(
+        """
+        <h1>CIP Meetings</h1>
+        <p><a href=\"{{ url_for('new_meeting') }}\">{{ bilingual('Schedule new meeting', 'Neue Besprechung planen') }}</a></p>
+        <table>
+            <tr><th>ID</th><th>Date</th><th>Title</th><th>Notes</th></tr>
+            {% for meeting in meetings %}
+                <tr>
+                    <td><a href=\"{{ url_for('meeting_detail', meeting_id=meeting.id) }}\">#{{ meeting.id }}</a></td>
+                    <td>{{ meeting.date }}</td>
+                    <td>{{ meeting.title }}</td>
+                    <td>{{ meeting.notes or '-' }}</td>
+                </tr>
+            {% else %}
+                <tr><td colspan=\"4\">{{ bilingual('No meetings scheduled', 'Keine Besprechungen geplant') }}</td></tr>
+            {% endfor %}
+        </table>
+        """,
+        meetings=meetings,
+    )
+
+
+@app.route("/meetings/new", methods=["GET", "POST"])
+@login_required
+def new_meeting():
+    if request.method == "POST":
+        title = (request.form.get("title") or "").strip()
+        date = _parse_date(request.form.get("date"))
+        notes = request.form.get("notes") or None
+        if not title or not date:
+            flash(
+                bilingual(
+                    "Title and date are required",
+                    "Titel und Datum sind erforderlich",
+                )
+            )
+        else:
+            meeting = CIPMeeting(title=title, date=date, notes=notes)
+            db.session.add(meeting)
+            db.session.commit()
+            flash(
+                bilingual(
+                    "Meeting created",
+                    "Besprechung erstellt",
+                )
+            )
+            return redirect(url_for("meeting_detail", meeting_id=meeting.id))
+    return render_page(
+        """
+        <h1>{{ bilingual('New Meeting', 'Neue Besprechung') }}</h1>
+        <form method=\"post\">
+            {{ csrf_token() }}
+            <label>{{ bilingual('Title', 'Titel') }}</label>
+            <input type=\"text\" name=\"title\" required>
+            <label>{{ bilingual('Date', 'Datum') }}</label>
+            <input type=\"date\" name=\"date\" required>
+            <label>{{ bilingual('Notes', 'Notizen') }}</label>
+            <textarea name=\"notes\" rows=\"4\"></textarea>
+            <button type=\"submit\">{{ bilingual('Create', 'Erstellen') }}</button>
+        </form>
+        """
+    )
+
+
+@app.route("/meetings/<int:meeting_id>", methods=["GET", "POST"])
+@login_required
+def meeting_detail(meeting_id):
+    meeting = CIPMeeting.query.get_or_404(meeting_id)
+    if request.method == "POST":
+        measure_id = _to_int(request.form.get("measure_id"))
+        notes = request.form.get("discussion_notes") or None
+        measure = CIPMeasure.query.get(measure_id) if measure_id else None
+        if not measure:
+            flash(
+                bilingual(
+                    "Valid CIP ID required",
+                    "Gültige CIP-ID erforderlich",
+                )
+            )
+        elif not can_do(current_user, "view_measure", measure=measure):
+            flash(
+                bilingual(
+                    "You cannot link this CIP",
+                    "Sie können diesen CIP nicht verknüpfen",
+                )
+            )
+        else:
+            item = CIPMeetingItem(
+                meeting_id=meeting.id,
+                measure_id=measure.id,
+                discussion_notes=notes,
+            )
+            db.session.add(item)
+            db.session.commit()
+            flash(
+                bilingual(
+                    "CIP linked to meeting",
+                    "CIP mit Besprechung verknüpft",
+                )
+            )
+            return redirect(url_for("meeting_detail", meeting_id=meeting.id))
+    return render_page(
+        """
+        <h1>Meeting #{{ meeting.id }} - {{ meeting.title }}</h1>
+        <p>{{ bilingual('Date', 'Datum') }}: {{ meeting.date }}</p>
+        <p>{{ meeting.notes or '-' }}</p>
+        <h2>{{ bilingual('Discussed CIP items', 'Besprochene CIP-Einträge') }}</h2>
+        <ul>
+            {% for item in meeting.items %}
+                <li><a href=\"{{ url_for('view_cip', measure_id=item.measure.id) }}\">#{{ item.measure.id }}</a> - {{ item.measure.title }} ({{ item.discussion_notes or '-' }})</li>
+            {% else %}
+                <li>{{ bilingual('No items yet', 'Noch keine Einträge') }}</li>
+            {% endfor %}
+        </ul>
+        <h3>{{ bilingual('Add CIP to meeting', 'CIP zur Besprechung hinzufügen') }}</h3>
+        <form method=\"post\">
+            {{ csrf_token() }}
+            <label>{{ bilingual('CIP ID', 'CIP-ID') }}</label>
+            <input type=\"number\" name=\"measure_id\" required>
+            <label>{{ bilingual('Discussion notes', 'Diskussionsnotizen') }}</label>
+            <textarea name=\"discussion_notes\" rows=\"3\"></textarea>
+            <button type=\"submit\">{{ bilingual('Link CIP', 'CIP verknüpfen') }}</button>
+        </form>
+        """,
+        meeting=meeting,
+    )
+
+
+@app.route("/export/cip")
+@login_required
+def export_cip():
+    filters = _extract_dashboard_filters()
+    measures = _apply_measure_filters(_base_measure_query(), filters).order_by(CIPMeasure.id.asc()).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "id",
+            "title",
+            "status",
+            "priority",
+            "creator",
+            "responsible",
+            "reporting_department",
+            "responsible_department",
+            "created_at",
+            "reported_at",
+            "implemented_at",
+            "closed_at",
+            "risk_score",
+            "expected_saving",
+        ]
+    )
+    for measure in measures:
+        writer.writerow(
+            [
+                measure.id,
+                measure.title,
+                measure.status,
+                measure.priority.name if measure.priority else "",
+                measure.creator.username if measure.creator else "",
+                measure.responsible.username if measure.responsible else "",
+                measure.reporting_department.name if measure.reporting_department else "",
+                measure.responsible_department.name if measure.responsible_department else "",
+                measure.created_at,
+                measure.reported_at,
+                measure.implemented_at,
+                measure.closed_at,
+                measure.risk_score or "",
+                measure.expected_saving_per_year or "",
+            ]
+        )
+    csv_data = output.getvalue()
+    response = Response(csv_data, mimetype="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=cip_export.csv"
+    return response
+
+
+@app.route("/reports")
+@login_required
+def reports():
+    monthly_counts = (
+        db.session.query(func.strftime("%Y-%m", CIPMeasure.created_at), func.count(CIPMeasure.id))
+        .group_by(func.strftime("%Y-%m", CIPMeasure.created_at))
+        .order_by(func.strftime("%Y-%m", CIPMeasure.created_at).desc())
+        .all()
+    )
+    category_counts = (
+        db.session.query(Category.name, func.count(CIPMeasure.id))
+        .outerjoin(CIPMeasure, CIPMeasure.category_id == Category.id)
+        .group_by(Category.id)
+        .all()
+    )
+    return render_page(
+        """
+        <h1>{{ bilingual('Reports', 'Berichte') }}</h1>
+        <h2>{{ bilingual('Monthly intake', 'Monatliche Eingänge') }}</h2>
+        <table>
+            <tr><th>{{ bilingual('Month', 'Monat') }}</th><th>{{ bilingual('Count', 'Anzahl') }}</th></tr>
+            {% for month, count in monthly_counts %}
+                <tr><td>{{ month }}</td><td>{{ count }}</td></tr>
+            {% else %}
+                <tr><td colspan=\"2\">{{ bilingual('No data yet', 'Noch keine Daten') }}</td></tr>
+            {% endfor %}
+        </table>
+        <h2>{{ bilingual('By category', 'Nach Kategorie') }}</h2>
+        <table>
+            <tr><th>{{ bilingual('Category', 'Kategorie') }}</th><th>{{ bilingual('Count', 'Anzahl') }}</th></tr>
+            {% for name, count in category_counts %}
+                <tr><td>{{ name or '-' }}</td><td>{{ count }}</td></tr>
+            {% else %}
+                <tr><td colspan=\"2\">{{ bilingual('No data yet', 'Noch keine Daten') }}</td></tr>
+            {% endfor %}
+        </table>
+        """,
+        monthly_counts=monthly_counts,
+        category_counts=category_counts,
+    )
+
+
+def _require_api_token():
+    token = request.args.get("token")
+    if token != API_TOKEN:
+        return False
+    return True
+
+
+@app.route("/api/cip")
+def api_cip_list():
+    if not _require_api_token():
+        return jsonify({"error": "invalid token"}), 401
+    measures = CIPMeasure.query.order_by(CIPMeasure.id.asc()).all()
+    return jsonify([measure.to_dict() for measure in measures])
+
+
+@app.route("/api/cip/<int:measure_id>")
+def api_cip_detail(measure_id):
+    if not _require_api_token():
+        return jsonify({"error": "invalid token"}), 401
+    measure = CIPMeasure.query.get_or_404(measure_id)
+    return jsonify(measure.to_dict())
 
 
 def _form_options():
@@ -853,17 +1676,121 @@ def _form_options():
         seat_types=SeatType.query.order_by(SeatType.name).all(),
         priorities=Priority.query.order_by(Priority.name).all(),
         responsible_users=User.query.join(Role).filter(Role.name == "RESPONSIBLE").all(),
+        templates=CIPTemplate.query.order_by(CIPTemplate.name).all(),
+        risk_scale=RISK_SCALE,
+        currencies=CURRENCIES,
     )
+
+
+def _base_measure_query():
+    query = CIPMeasure.query
+    role = current_user.role.name
+    if role == "ADMIN":
+        return query
+    if role == "MANAGER":
+        if current_user.department_id:
+            return query.filter(
+                or_(
+                    CIPMeasure.reporting_department_id == current_user.department_id,
+                    CIPMeasure.responsible_department_id == current_user.department_id,
+                )
+            )
+        return query.filter(CIPMeasure.id == -1)
+    if role == "CREATOR":
+        return query.filter_by(creator_id=current_user.id)
+    responsible_filters = [CIPMeasure.responsible_id == current_user.id]
+    if current_user.delegate_id:
+        responsible_filters.append(CIPMeasure.responsible_id == current_user.delegate_id)
+    return query.filter(or_(*responsible_filters))
+
+
+def _extract_dashboard_filters():
+    statuses = [s for s in request.args.getlist("status") if s in WORKFLOW_STATUSES]
+    single_status = (request.args.get("status") or "").strip().upper()
+    if not statuses and single_status in WORKFLOW_STATUSES:
+        statuses = [single_status]
+    filters = dict(
+        statuses=statuses,
+        department_id=_to_int(request.args.get("department_id") or request.args.get("department")),
+        priority_id=_to_int(request.args.get("priority_id") or request.args.get("priority")),
+        creator_id=_to_int(request.args.get("creator_id")),
+        responsible_id=_to_int(request.args.get("responsible_id")),
+        q=(request.args.get("q") or "").strip(),
+        risk_min=_to_int(request.args.get("risk_min")),
+        favorites_only=bool(request.args.get("favorites_only")),
+    )
+    return filters
+
+
+def _apply_measure_filters(query, filters):
+    if filters["statuses"]:
+        query = query.filter(CIPMeasure.status.in_(filters["statuses"]))
+    if filters["department_id"]:
+        query = query.filter(
+            CIPMeasure.reporting_department_id == filters["department_id"]
+        )
+    if filters["priority_id"]:
+        query = query.filter(CIPMeasure.priority_id == filters["priority_id"])
+    if filters["creator_id"]:
+        query = query.filter(CIPMeasure.creator_id == filters["creator_id"])
+    if filters["responsible_id"]:
+        query = query.filter(CIPMeasure.responsible_id == filters["responsible_id"])
+    if filters["risk_min"]:
+        query = query.filter(
+            CIPMeasure.risk_impact.isnot(None),
+            CIPMeasure.risk_probability.isnot(None),
+            (CIPMeasure.risk_impact * CIPMeasure.risk_probability)
+            >= filters["risk_min"],
+        )
+    if filters["q"]:
+        like = f"%{filters['q']}%"
+        query = query.filter(
+            or_(
+                CIPMeasure.title.ilike(like),
+                CIPMeasure.problem_description.ilike(like),
+            )
+        )
+    if filters["favorites_only"]:
+        query = query.join(
+            CIPFavorite, CIPFavorite.measure_id == CIPMeasure.id
+        ).filter(CIPFavorite.user_id == current_user.id)
+    return query
+
+
+def _favorite_ids_for_user(user):
+    if not user.is_authenticated:
+        return set()
+    return {fav.measure_id for fav in CIPFavorite.query.filter_by(user_id=user.id).all()}
+
+
+def _due_date_hint(measure):
+    if not measure.planned_due_date:
+        return None, None
+    days_left = (measure.planned_due_date - datetime.utcnow().date()).days
+    if days_left < 0:
+        return "danger", bilingual("Overdue", "Überfällig")
+    if days_left <= 3:
+        return "warning", bilingual("Due soon", "Bald fällig")
+    return None, None
 
 
 CIP_FORM_TEMPLATE = """
         <h1>{{ heading }}</h1>
         <form method=\"post\" action=\"{{ form_action }}\">
             {{ csrf_token() }}
+            {% if template_picker_base and templates %}
+                <label>Template / Vorlage</label>
+                <select onchange=\"if(this.value){ window.location='{{ template_picker_base }}?template_id='+this.value; }\">
+                    <option value=\"\">-</option>
+                    {% for template in templates %}
+                        <option value=\"{{ template.id }}\">{{ template.name }}</option>
+                    {% endfor %}
+                </select>
+            {% endif %}
             <label>Title / Titel</label>
             <input type=\"text\" name=\"title\" value=\"{{ measure.title if measure else '' }}\" required>
             <label>Problem Description / Problembeschreibung</label>
-            <textarea name=\"problem_description\" rows=\"4\" required>{{ measure.problem_description if measure else '' }}</textarea>
+            <textarea name=\"problem_description\" rows=\"4\" required>{{ measure.problem_description if measure else prefill_description or '' }}</textarea>
             <label>Reporting Department / Meldende Abteilung</label>
             <select name=\"reporting_department_id\">
                 <option value=\"\">-</option>
@@ -916,6 +1843,44 @@ CIP_FORM_TEMPLATE = """
             <textarea name=\"root_cause\" rows=\"3\">{{ measure.root_cause if measure else '' }}</textarea>
             <label>Attention List (semicolon separated) / Verteilerliste (mit Semikolon)</label>
             <input type=\"text\" name=\"attention_list\" value=\"{{ measure.attention_list if measure else '' }}\">
+            <div class=\"flex\">
+                <div>
+                    <label>Risk Impact (1-5) / Risikoauswirkung</label>
+                    <select name=\"risk_impact\">
+                        <option value=\"\">-</option>
+                        {% for score in risk_scale %}
+                            <option value=\"{{ score }}\" {% if (measure.risk_impact if measure else None) == score %}selected{% endif %}>{{ score }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label>Risk Probability (1-5) / Risikowahrscheinlichkeit</label>
+                    <select name=\"risk_probability\">
+                        <option value=\"\">-</option>
+                        {% for score in risk_scale %}
+                            <option value=\"{{ score }}\" {% if (measure.risk_probability if measure else None) == score %}selected{% endif %}>{{ score }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            <label><input type=\"checkbox\" name=\"safety_related\" value=\"1\" {% if measure and measure.safety_related %}checked{% endif %}> Safety related / Sicherheitsrelevant</label>
+            <label><input type=\"checkbox\" name=\"customer_impact\" value=\"1\" {% if measure and measure.customer_impact %}checked{% endif %}> Customer impact / Kundenwirkung</label>
+            <div class=\"flex\">
+                <div>
+                    <label>Expected Saving per Year / Erwartete Einsparung p.a.</label>
+                    <input type=\"number\" step=\"0.01\" name=\"expected_saving_per_year\" value=\"{{ measure.expected_saving_per_year if measure and measure.expected_saving_per_year is not none else '' }}\">
+                </div>
+                <div>
+                    <label>Currency / Währung</label>
+                    <select name=\"saving_currency\">
+                        <option value=\"\">-</option>
+                        {% set selected_currency = measure.saving_currency if measure else '' %}
+                        {% for currency in currencies %}
+                            <option value=\"{{ currency }}\" {% if selected_currency == currency %}selected{% endif %}>{{ currency }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
             <div class=\"button-row\">
                 <button type=\"submit\">{{ submit_label }}</button>
                 {% if cancel_url %}
@@ -940,6 +1905,12 @@ def new_cip():
         abort(403)
     options = _form_options()
     default_priority_id = _default_priority_id(options["priorities"])
+    template_prefill = request.form.get("problem_description") or ""
+    template_id = _to_int(request.args.get("template_id"))
+    if template_id and request.method == "GET":
+        template = CIPTemplate.query.get(template_id)
+        if template:
+            template_prefill = template.content or ""
     if request.method == "POST":
         title = request.form.get("title", "").strip()
         description = request.form.get("problem_description", "").strip()
@@ -970,6 +1941,14 @@ def new_cip():
                 theme_type=request.form.get("theme_type") or "CORRECTION",
                 root_cause=request.form.get("root_cause") or None,
                 attention_list=request.form.get("attention_list") or None,
+                risk_impact=_to_int(request.form.get("risk_impact")),
+                risk_probability=_to_int(request.form.get("risk_probability")),
+                safety_related=bool(request.form.get("safety_related")),
+                customer_impact=bool(request.form.get("customer_impact")),
+                expected_saving_per_year=_to_float(
+                    request.form.get("expected_saving_per_year")
+                ),
+                saving_currency=request.form.get("saving_currency") or None,
             )
             db.session.add(measure)
             db.session.flush()
@@ -999,6 +1978,8 @@ def new_cip():
         default_priority_id=default_priority_id,
         default_theme="CORRECTION",
         theme_types=THEME_TYPES,
+        prefill_description=template_prefill,
+        template_picker_base=url_for("new_cip"),
         **options,
     )
 
@@ -1041,6 +2022,14 @@ def edit_cip(measure_id):
             measure.theme_type = request.form.get("theme_type") or "CORRECTION"
             measure.root_cause = request.form.get("root_cause") or None
             measure.attention_list = request.form.get("attention_list") or None
+            measure.risk_impact = _to_int(request.form.get("risk_impact"))
+            measure.risk_probability = _to_int(request.form.get("risk_probability"))
+            measure.safety_related = bool(request.form.get("safety_related"))
+            measure.customer_impact = bool(request.form.get("customer_impact"))
+            measure.expected_saving_per_year = _to_float(
+                request.form.get("expected_saving_per_year")
+            )
+            measure.saving_currency = request.form.get("saving_currency") or None
             record_log(
                 "CIP_DRAFT_EDIT",
                 bilingual(
@@ -1067,6 +2056,8 @@ def edit_cip(measure_id):
         default_priority_id=default_priority_id,
         default_theme=measure.theme_type or "CORRECTION",
         theme_types=THEME_TYPES,
+        prefill_description=measure.problem_description,
+        template_picker_base=None,
         **options,
     )
 
@@ -1088,9 +2079,37 @@ def view_cip(measure_id):
         .all()
     )
     users = User.query.order_by(User.username).all()
+    attachments = (
+        CIPAttachment.query.filter_by(measure_id=measure.id)
+        .order_by(CIPAttachment.uploaded_at.desc())
+        .all()
+    )
+    comments = (
+        CIPComment.query.filter_by(measure_id=measure.id)
+        .order_by(CIPComment.created_at.asc())
+        .all()
+    )
+    sla_info = check_sla(measure)
+    is_favorite = measure.id in _favorite_ids_for_user(current_user)
     return render_page(
         """
-        <h1>CIP #{{ measure.id }} - {{ measure.title }}</h1>
+        <div style=\"display:flex; justify-content:space-between; align-items:center;\">
+            <h1>CIP #{{ measure.id }} - {{ measure.title }}</h1>
+            <form method=\"post\" action=\"{{ url_for('toggle_favorite', measure_id=measure.id) }}\">
+                {{ csrf_token() }}
+                <button type=\"submit\">{% if is_favorite %}★ {{ bilingual('Favorite', 'Favorit') }}{% else %}☆ {{ bilingual('Add to favorites', 'Zu Favoriten hinzufügen') }}{% endif %}</button>
+            </form>
+        </div>
+        {% if sla_info and not sla_info.is_ok %}
+            <div class=\"danger\">
+                <strong>{{ bilingual('SLA violation detected', 'SLA-Verletzung erkannt') }}</strong>
+                <ul>
+                    {% for violation in sla_info.violations %}
+                        <li>{{ violation.from_status }}→{{ violation.to_status }} ({{ violation.actual_days }} / {{ violation.max_days }} {{ bilingual('days', 'Tage') }})</li>
+                    {% endfor %}
+                </ul>
+            </div>
+        {% endif %}
         <div class=\"flex\">
             <div class=\"card\">
                 <h3>Key Facts / Kerndaten</h3>
@@ -1106,6 +2125,13 @@ def view_cip(measure_id):
                 <p>Theme Type / Thema-Art: {{ measure.theme_type }}</p>
                 <p>Root Cause / Grundursache: {{ measure.root_cause or '-' }}</p>
                 <p>Attention List / Verteilerliste: {{ measure.attention_list or '-' }}</p>
+                <p>Risk Impact / Risikoauswirkung: {{ measure.risk_impact or '-' }}</p>
+                <p>Risk Probability / Risikowahrscheinlichkeit: {{ measure.risk_probability or '-' }}</p>
+                <p>Risk Score / Risikoscore: {{ measure.risk_score or '-' }}</p>
+                <p>Safety related / Sicherheitsrelevant: {{ 'Yes / Ja' if measure.safety_related else 'No / Nein' }}</p>
+                <p>Customer impact / Kundenwirkung: {{ 'Yes / Ja' if measure.customer_impact else 'No / Nein' }}</p>
+                <p>Expected Saving / Erwartete Einsparung: {{ measure.expected_saving_per_year or '-' }} {{ measure.saving_currency or '' }}</p>
+                <p>Actual Saving 1st Year / Tatsächliche Einsparung erstes Jahr: {{ measure.actual_saving_first_year or '-' }} {{ measure.saving_currency or '' }}</p>
                 {% if can_do(current_user, 'edit_draft', measure=measure) %}
                     <p><a href=\"{{ url_for('edit_cip', measure_id=measure.id) }}\">Edit Draft / Entwurf bearbeiten</a></p>
                 {% endif %}
@@ -1124,6 +2150,9 @@ def view_cip(measure_id):
                             <a href=\"{{ url_for('view_cip', measure_id=child.id) }}\">#{{ child.id }}</a>
                         {% endfor %}
                     </p>
+                {% endif %}
+                {% if measure.escalated_to %}
+                    <p>{{ bilingual('Escalated to', 'Eskaliert an') }}: {{ measure.escalated_to.username }} ({{ measure.escalated_at }})<br>{{ measure.escalation_reason }}</p>
                 {% endif %}
             </div>
             <div class=\"card\">
@@ -1147,6 +2176,67 @@ def view_cip(measure_id):
                 <p>Effectiveness note / Wirksamkeitsnotiz: {{ measure.effectiveness_comment or '-' }}</p>
             </div>
         </div>
+        {% if can_do(current_user, 'escalate', measure=measure) and sla_info and not sla_info.is_ok %}
+            <div class=\"card\">
+                <h3>Escalation / Eskalation</h3>
+                <form method=\"post\" action=\"{{ url_for('escalate_cip', measure_id=measure.id) }}\">
+                    {{ csrf_token() }}
+                    <label>{{ bilingual('Escalate to user', 'Eskalieren an Benutzer') }}</label>
+                    <select name=\"escalated_to_id\" required>
+                        <option value=\"\">-</option>
+                        {% for user in all_users %}
+                            <option value=\"{{ user.id }}\">{{ user.username }}</option>
+                        {% endfor %}
+                    </select>
+                    <label>{{ bilingual('Reason', 'Grund') }}</label>
+                    <textarea name=\"reason\" rows=\"3\" required></textarea>
+                    <button type=\"submit\">{{ bilingual('Escalate', 'Eskalieren') }}</button>
+                </form>
+            </div>
+        {% endif %}
+        <h2>{{ bilingual('Attachments', 'Anhänge') }}</h2>
+        <ul>
+            {% for attachment in attachments %}
+                <li>
+                    <a href=\"{{ url_for('download_attachment', attachment_id=attachment.id) }}\">{{ attachment.filename }}</a>
+                    <small>{{ bilingual('Uploaded', 'Hochgeladen') }} {{ attachment.uploaded_at.strftime('%Y-%m-%d %H:%M') }} {{ bilingual('by', 'von') }} {{ attachment.uploaded_by.username }}</small>
+                </li>
+            {% else %}
+                <li>{{ bilingual('No attachments yet', 'Noch keine Anhänge') }}</li>
+            {% endfor %}
+        </ul>
+        {% if can_do(current_user, 'manage_attachments', measure=measure) %}
+            <form method=\"post\" action=\"{{ url_for('upload_attachment', measure_id=measure.id) }}\" enctype=\"multipart/form-data\">
+                {{ csrf_token() }}
+                <label>{{ bilingual('Upload file', 'Datei hochladen') }}</label>
+                <input type=\"file\" name=\"file\" required>
+                <button type=\"submit\">{{ bilingual('Upload', 'Hochladen') }}</button>
+            </form>
+        {% endif %}
+        <h2>{{ bilingual('Comments', 'Kommentare') }}</h2>
+        <ul>
+            {% for comment in comments %}
+                <li><strong>{{ comment.user.username }}</strong> ({{ comment.created_at.strftime('%Y-%m-%d %H:%M') }}): {{ comment.text }}</li>
+            {% else %}
+                <li>{{ bilingual('No comments yet', 'Noch keine Kommentare') }}</li>
+            {% endfor %}
+        </ul>
+        {% if can_do(current_user, 'comment', measure=measure) %}
+            <form method=\"post\" action=\"{{ url_for('add_comment', measure_id=measure.id) }}\">
+                {{ csrf_token() }}
+                <label>{{ bilingual('New comment', 'Neuer Kommentar') }}</label>
+                <textarea name=\"text\" rows=\"3\" required></textarea>
+                <button type=\"submit\">{{ bilingual('Add comment', 'Kommentar hinzufügen') }}</button>
+            </form>
+        {% endif %}
+        {% if measure.meetings %}
+            <h2>{{ bilingual('Discussed in Meetings', 'In Besprechungen behandelt') }}</h2>
+            <ul>
+                {% for item in measure.meetings %}
+                    <li><a href=\"{{ url_for('meeting_detail', meeting_id=item.meeting.id) }}\">#{{ item.meeting.id }}</a> - {{ item.meeting.date }} - {{ item.meeting.title }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
         <h2>Workflow History / Workflow-Historie</h2>
         <table>
             <tr><th>From / Von</th><th>To / Nach</th><th>User / Benutzer</th><th>Date / Datum</th><th>Comment / Kommentar</th></tr>
@@ -1242,6 +2332,15 @@ def view_cip(measure_id):
                 <textarea name=\"effectiveness_check_method\" rows=\"3\">{{ measure.effectiveness_check_method or '' }}</textarea>
                 <label>Effectiveness Check Date / Wirksamkeitsprüfung Termin</label>
                 <input type=\"date\" name=\"effectiveness_check_date\" value=\"{{ measure.effectiveness_check_date }}\">
+                <label>Expected Saving per Year / Erwartete Einsparung p.a.</label>
+                <input type=\"number\" step=\"0.01\" name=\"expected_saving_per_year\" value=\"{{ measure.expected_saving_per_year or '' }}\">
+                <label>Currency / Währung</label>
+                <select name=\"saving_currency\">
+                    <option value=\"\">-</option>
+                    {% for currency in currencies %}
+                        <option value=\"{{ currency }}\" {% if measure.saving_currency == currency %}selected{% endif %}>{{ currency }}</option>
+                    {% endfor %}
+                </select>
                 <button type=\"submit\">Submit Solution / Lösung senden</button>
             </form>
         {% endif %}
@@ -1280,6 +2379,8 @@ def view_cip(measure_id):
                     <option value=\"EFFECTIVE\">Effective / Wirksam</option>
                     <option value=\"NOT_EFFECTIVE\">Not Effective / Nicht wirksam</option>
                 </select>
+                <label>Actual Saving First Year / Tatsächliche Einsparung erstes Jahr</label>
+                <input type=\"number\" step=\"0.01\" name=\"actual_saving_first_year\" value=\"{{ measure.actual_saving_first_year or '' }}\">
                 <label>Comment / Kommentar</label>
                 <textarea name=\"effectiveness_comment\" rows=\"3\"></textarea>
                 <button type=\"submit\">Save Evaluation / Bewertung speichern</button>
@@ -1290,6 +2391,11 @@ def view_cip(measure_id):
         history=history,
         tasks=tasks,
         all_users=users,
+        attachments=attachments,
+        comments=comments,
+        sla_info=sla_info,
+        is_favorite=is_favorite,
+        currencies=CURRENCIES,
     )
 
 
@@ -1307,6 +2413,49 @@ def _to_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def check_sla(measure, rules=None, history_entries=None):
+    if rules is None:
+        rules = SLARule.query.all()
+    result = {"violations": [], "is_ok": True}
+    if not rules:
+        return result
+    if history_entries is None:
+        history_entries = (
+            CIPMeasureHistory.query.filter_by(measure_id=measure.id)
+            .order_by(CIPMeasureHistory.changed_at.asc())
+            .all()
+        )
+    status_times = {"DRAFT": measure.created_at}
+    for entry in history_entries:
+        status_times.setdefault(entry.to_status, entry.changed_at)
+    now = datetime.utcnow()
+    for rule in rules:
+        start = status_times.get(rule.from_status)
+        if not start:
+            continue
+        end = status_times.get(rule.to_status)
+        delta = (end or now) - start
+        actual_days = max(delta.days, 0)
+        if actual_days > rule.max_days:
+            result["violations"].append(
+                dict(
+                    from_status=rule.from_status,
+                    to_status=rule.to_status,
+                    max_days=rule.max_days,
+                    actual_days=actual_days,
+                )
+            )
+    result["is_ok"] = not result["violations"]
+    return result
 
 
 def ensure_status_requirements(measure, target_status):
@@ -1339,6 +2488,8 @@ def _record_history(measure, new_status, comment=None):
     if timestamp_field:
         setattr(measure, timestamp_field, datetime.utcnow())
     db.session.add(entry)
+    record_audit(f"STATUS_{new_status}", measure, comment)
+    _dispatch_status_notifications(measure, new_status)
 
 
 def record_log(event_type, description, measure=None):
@@ -1351,6 +2502,16 @@ def record_log(event_type, description, measure=None):
     db.session.add(entry)
 
 
+def record_audit(action, measure=None, details=None):
+    entry = AuditLog(
+        user_id=current_user.id if current_user.is_authenticated else None,
+        action=action,
+        measure_id=measure.id if isinstance(measure, CIPMeasure) else measure,
+        details=details,
+    )
+    db.session.add(entry)
+
+
 def send_system_email(recipient, subject, body):
     record_log(
         "EMAIL",
@@ -1359,6 +2520,32 @@ def send_system_email(recipient, subject, body):
             f"E-Mail an {recipient}: {subject} - {body}",
         ),
     )
+
+
+def notify(user, message, link=None):
+    if not user:
+        return
+    entry = Notification(user_id=user.id, message=message, link=link)
+    db.session.add(entry)
+
+
+def _dispatch_status_notifications(measure, new_status):
+    rule = STATUS_NOTIFICATION_RULES.get(new_status)
+    if not rule:
+        return
+    recipients = [u for u in rule(measure) if u]
+    if not recipients:
+        return
+    link = url_for("view_cip", measure_id=measure.id)
+    for recipient in recipients:
+        notify(
+            recipient,
+            bilingual(
+                f"CIP #{measure.id} moved to {new_status}",
+                f"CIP #{measure.id} in Status {new_status} gewechselt",
+            ),
+            link,
+        )
 
 
 def create_email_token(user):
@@ -1453,6 +2640,8 @@ def propose_solution(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     if not can_do(current_user, "propose_solution", measure=measure):
         abort(403)
+    if current_user.role.name == "RESPONSIBLE" and not current_user_is_allowed(measure):
+        abort(403)
     measure.sofort_needed = bool(request.form.get("sofort_needed"))
     measure.sofort_action = request.form.get("sofort_action") or None
     measure.planned_action = request.form.get("planned_action") or None
@@ -1463,6 +2652,10 @@ def propose_solution(measure_id):
     measure.effectiveness_check_date = _parse_date(
         request.form.get("effectiveness_check_date")
     )
+    measure.expected_saving_per_year = _to_float(
+        request.form.get("expected_saving_per_year")
+    )
+    measure.saving_currency = request.form.get("saving_currency") or measure.saving_currency
     try:
         _record_history(measure, "SOLUTION_PROPOSED")
     except ValueError as exc:
@@ -1550,6 +2743,8 @@ def mark_implemented(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     if not can_do(current_user, "mark_implemented", measure=measure):
         abort(403)
+    if current_user.role.name == "RESPONSIBLE" and not current_user_is_allowed(measure):
+        abort(403)
     implemented_action = request.form.get("implemented_action", "").strip()
     if not implemented_action:
         flash(
@@ -1609,6 +2804,9 @@ def evaluate_effectiveness(measure_id):
         return redirect(url_for("view_cip", measure_id=measure.id))
     measure.effectiveness_status = status
     measure.effectiveness_comment = comment
+    measure.actual_saving_first_year = _to_float(
+        request.form.get("actual_saving_first_year")
+    )
 
     if status == "EFFECTIVE":
         try:
@@ -2001,6 +3199,9 @@ def admin_panel():
             <li><a href=\"{{ url_for('manage_categories') }}\">Categories / Kategorien</a></li>
             <li><a href=\"{{ url_for('manage_seat_types') }}\">Seat Types / Sitztypen</a></li>
             <li><a href=\"{{ url_for('manage_priorities') }}\">Priorities / Prioritäten</a></li>
+            <li><a href=\"{{ url_for('manage_sla') }}\">SLA Rules</a></li>
+            <li><a href=\"{{ url_for('manage_templates') }}\">Templates</a></li>
+            <li><a href=\"{{ url_for('view_audit') }}\">Audit Log</a></li>
         </ul>
         """
     )
@@ -2080,6 +3281,87 @@ def _generic_manage(model, title_en, title_de, endpoint, usage_check):
     )
 
 
+@app.route("/admin/sla", methods=["GET", "POST"])
+@login_required
+@admin_required
+def manage_sla():
+    if request.method == "POST":
+        from_status = request.form.get("from_status")
+        to_status = request.form.get("to_status")
+        max_days = _to_int(request.form.get("max_days"))
+        if not from_status or not to_status or not max_days:
+            flash(
+                bilingual(
+                    "All SLA fields are required",
+                    "Alle SLA-Felder sind erforderlich",
+                )
+            )
+        else:
+            rule = SLARule(
+                from_status=from_status,
+                to_status=to_status,
+                max_days=max_days,
+            )
+            db.session.add(rule)
+            db.session.commit()
+            flash(
+                bilingual(
+                    "SLA rule added",
+                    "SLA-Regel hinzugefügt",
+                )
+            )
+    delete_id = request.args.get("delete")
+    if delete_id:
+        rule = SLARule.query.get(delete_id)
+        if rule:
+            db.session.delete(rule)
+            db.session.commit()
+            flash(
+                bilingual(
+                    "SLA rule deleted",
+                    "SLA-Regel gelöscht",
+                )
+            )
+    rules = SLARule.query.order_by(SLARule.from_status, SLARule.to_status).all()
+    return render_page(
+        """
+        <h1>SLA Rules</h1>
+        <form method=\"post\">
+            {{ csrf_token() }}
+            <label>From Status</label>
+            <select name=\"from_status\" required>
+                {% for status in WORKFLOW_STATUSES %}
+                    <option value=\"{{ status }}\">{{ status }}</option>
+                {% endfor %}
+            </select>
+            <label>To Status</label>
+            <select name=\"to_status\" required>
+                {% for status in WORKFLOW_STATUSES %}
+                    <option value=\"{{ status }}\">{{ status }}</option>
+                {% endfor %}
+            </select>
+            <label>Max Days / Maximale Tage</label>
+            <input type=\"number\" name=\"max_days\" min=\"1\" required>
+            <button type=\"submit\">Add Rule</button>
+        </form>
+        <table>
+            <tr><th>From</th><th>To</th><th>Max Days</th><th>Action</th></tr>
+            {% for rule in rules %}
+                <tr>
+                    <td>{{ rule.from_status }}</td>
+                    <td>{{ rule.to_status }}</td>
+                    <td>{{ rule.max_days }}</td>
+                    <td><a href=\"{{ url_for('manage_sla', delete=rule.id) }}\">Delete</a></td>
+                </tr>
+            {% else %}
+                <tr><td colspan=\"4\">{{ bilingual('No SLA rules defined', 'Keine SLA-Regeln definiert') }}</td></tr>
+            {% endfor %}
+        </table>
+        """,
+        rules=rules,
+    )
+
+
 @app.route("/admin/departments", methods=["GET", "POST"])
 @login_required
 @admin_required
@@ -2128,6 +3410,74 @@ def manage_priorities():
     return _generic_manage(Priority, "Priority", "Priorität", "manage_priorities", usage_check)
 
 
+@app.route("/admin/templates", methods=["GET", "POST"])
+@login_required
+@admin_required
+def manage_templates():
+    if request.method == "POST":
+        name = (request.form.get("name") or "").strip()
+        description = request.form.get("description") or ""
+        content = request.form.get("content") or ""
+        if not name:
+            flash(
+                bilingual(
+                    "Template name is required",
+                    "Vorlagenname ist erforderlich",
+                )
+            )
+        else:
+            template = CIPTemplate(name=name, description=description, content=content)
+            db.session.add(template)
+            db.session.commit()
+            flash(
+                bilingual(
+                    "Template saved",
+                    "Vorlage gespeichert",
+                )
+            )
+    delete_id = request.args.get("delete")
+    if delete_id:
+        template = CIPTemplate.query.get(delete_id)
+        if template:
+            db.session.delete(template)
+            db.session.commit()
+            flash(
+                bilingual(
+                    "Template deleted",
+                    "Vorlage gelöscht",
+                )
+            )
+    templates = CIPTemplate.query.order_by(CIPTemplate.name).all()
+    return render_page(
+        """
+        <h1>Templates / Vorlagen</h1>
+        <form method=\"post\">
+            {{ csrf_token() }}
+            <label>Name</label>
+            <input type=\"text\" name=\"name\" required>
+            <label>Description / Beschreibung</label>
+            <textarea name=\"description\" rows=\"2\"></textarea>
+            <label>Content / Inhalt</label>
+            <textarea name=\"content\" rows=\"4\" required></textarea>
+            <button type=\"submit\">Save Template</button>
+        </form>
+        <table>
+            <tr><th>Name</th><th>Description</th><th>Action</th></tr>
+            {% for template in templates %}
+                <tr>
+                    <td>{{ template.name }}</td>
+                    <td>{{ template.description or '-' }}</td>
+                    <td><a href=\"{{ url_for('manage_templates', delete=template.id) }}\">Delete</a></td>
+                </tr>
+            {% else %}
+                <tr><td colspan=\"3\">{{ bilingual('No templates yet', 'Noch keine Vorlagen') }}</td></tr>
+            {% endfor %}
+        </table>
+        """,
+        templates=templates,
+    )
+
+
 @app.route("/admin/users", methods=["GET", "POST"])
 @login_required
 @admin_required
@@ -2139,6 +3489,8 @@ def manage_users():
             password = request.form.get("password", "")
             role_id = request.form.get("role_id")
             email = (request.form.get("email") or "").strip().lower()
+            department_id = _to_int(request.form.get("department_id"))
+            delegate_id = _to_int(request.form.get("delegate_id"))
             if not username or not password or not role_id or not email:
                 flash(
                     bilingual(
@@ -2170,6 +3522,8 @@ def manage_users():
                     requires_approval=False,
                     approved_at=datetime.utcnow(),
                     approved_by_id=current_user.id,
+                    department_id=department_id,
+                    delegate_id=delegate_id,
                 )
                 db.session.add(user)
                 db.session.commit()
@@ -2185,6 +3539,8 @@ def manage_users():
             role_id = request.form.get("role_id")
             password = request.form.get("password", "")
             email = (request.form.get("email") or "").strip().lower()
+            user.department_id = _to_int(request.form.get("department_id"))
+            user.delegate_id = _to_int(request.form.get("delegate_id"))
             if role_id:
                 user.role_id = int(role_id)
             if password:
@@ -2229,6 +3585,8 @@ def manage_users():
                 )
     users = User.query.order_by(User.username).all()
     roles = Role.query.order_by(Role.name).all()
+    departments = Department.query.order_by(Department.name).all()
+    potential_delegates = User.query.order_by(User.username).all()
     return render_page(
         """
         <h1>User Management / Benutzerverwaltung</h1>
@@ -2246,6 +3604,20 @@ def manage_users():
             <select name=\"role_id\" required>
                 {% for role in roles %}
                     <option value=\"{{ role.id }}\">{{ role.name }}</option>
+                {% endfor %}
+            </select>
+            <label>Department / Abteilung</label>
+            <select name=\"department_id\">
+                <option value=\"\">-</option>
+                {% for dept in departments %}
+                    <option value=\"{{ dept.id }}\">{{ dept.name }}</option>
+                {% endfor %}
+            </select>
+            <label>Delegate</label>
+            <select name=\"delegate_id\">
+                <option value=\"\">-</option>
+                {% for person in potential_delegates %}
+                    <option value=\"{{ person.id }}\">{{ person.username }}</option>
                 {% endfor %}
             </select>
             <button type=\"submit\">Create / Erstellen</button>
@@ -2293,6 +3665,20 @@ def manage_users():
                                     <option value=\"{{ role.id }}\" {% if role.id == user.role_id %}selected{% endif %}>{{ role.name }}</option>
                                 {% endfor %}
                             </select>
+                            <label>Department / Abteilung</label>
+                            <select name=\"department_id\">
+                                <option value=\"\">-</option>
+                                {% for dept in departments %}
+                                    <option value=\"{{ dept.id }}\" {% if user.department_id == dept.id %}selected{% endif %}>{{ dept.name }}</option>
+                                {% endfor %}
+                            </select>
+                            <label>Delegate</label>
+                            <select name=\"delegate_id\">
+                                <option value=\"\">-</option>
+                                {% for person in potential_delegates %}
+                                    <option value=\"{{ person.id }}\" {% if user.delegate_id == person.id %}selected{% endif %}>{{ person.username }}</option>
+                                {% endfor %}
+                            </select>
                             <label>New Password / Neues Passwort</label>
                             <input type=\"password\" name=\"password\" placeholder=\"Leave blank to keep / Leer lassen um zu behalten\">
                             <button type=\"submit\">Update / Aktualisieren</button>
@@ -2311,6 +3697,37 @@ def manage_users():
         """,
         users=users,
         roles=roles,
+        departments=departments,
+        potential_delegates=potential_delegates,
+    )
+
+
+@app.route("/admin/audit")
+@login_required
+@admin_required
+def view_audit():
+    logs = (
+        AuditLog.query.order_by(AuditLog.timestamp.desc()).limit(100).all()
+    )
+    return render_page(
+        """
+        <h1>Audit Log</h1>
+        <table>
+            <tr><th>Time</th><th>User</th><th>Action</th><th>Measure</th><th>Details</th></tr>
+            {% for log in logs %}
+                <tr>
+                    <td>{{ log.timestamp.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>{{ log.user.username if log.user else '-' }}</td>
+                    <td>{{ log.action }}</td>
+                    <td>{% if log.measure_id %}<a href=\"{{ url_for('view_cip', measure_id=log.measure_id) }}\">#{{ log.measure_id }}</a>{% else %}-{% endif %}</td>
+                    <td>{{ log.details or '-' }}</td>
+                </tr>
+            {% else %}
+                <tr><td colspan=\"5\">{{ bilingual('No audit entries yet', 'Noch keine Audit-Einträge') }}</td></tr>
+            {% endfor %}
+        </table>
+        """,
+        logs=logs,
     )
 
 
