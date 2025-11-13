@@ -659,7 +659,6 @@ def render_page(body_template, **context):
         EFFECTIVENESS_STATUSES=EFFECTIVENESS_STATUSES,
         TASK_STATUSES=TASK_STATUSES,
         TASK_STATUS_LABELS=TASK_STATUS_LABELS,
-        bilingual=bilingual,
         can_do=can_do,
         unread_notification_count=unread_notifications,
         **context
