@@ -26,7 +26,7 @@ from flask_login import (
     logout_user,
 )
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, inspect, text
 from flask_wtf import CSRFProtect
 from flask_wtf.csrf import generate_csrf
 from markupsafe import Markup
@@ -124,6 +124,80 @@ STATUS_NOTIFICATION_RULES = {
     "CLOSED_EFFECTIVE": lambda measure: [measure.creator, measure.responsible],
     "CLOSED_NOT_EFFECTIVE": lambda measure: [measure.creator, measure.responsible],
 }
+
+SCHEMA_PATCHES = {
+    "user": {
+        "email": "TEXT",
+        "is_email_confirmed": "BOOLEAN",
+        "requires_approval": "BOOLEAN",
+        "approved_by_id": "INTEGER",
+        "approved_at": "DATETIME",
+        "created_at": "DATETIME",
+        "department_id": "INTEGER",
+        "delegate_id": "INTEGER",
+    },
+    "cip_measure": {
+        "reported_at": "DATETIME",
+        "solution_proposed_at": "DATETIME",
+        "solution_accepted_at": "DATETIME",
+        "implemented_at": "DATETIME",
+        "closed_at": "DATETIME",
+        "reporting_department_id": "INTEGER",
+        "responsible_department_id": "INTEGER",
+        "category_id": "INTEGER",
+        "seat_type_id": "INTEGER",
+        "theme_type": "VARCHAR(32)",
+        "root_cause": "TEXT",
+        "attention_list": "TEXT",
+        "sofort_needed": "BOOLEAN",
+        "sofort_action": "TEXT",
+        "planned_action": "TEXT",
+        "planned_due_date": "DATE",
+        "effectiveness_check_method": "TEXT",
+        "effectiveness_check_date": "DATE",
+        "implemented_action": "TEXT",
+        "effectiveness_status": "VARCHAR(32)",
+        "effectiveness_comment": "TEXT",
+        "parent_measure_id": "INTEGER",
+        "escalated_to_id": "INTEGER",
+        "escalated_at": "DATETIME",
+        "escalation_reason": "TEXT",
+        "risk_impact": "INTEGER",
+        "risk_probability": "INTEGER",
+        "safety_related": "BOOLEAN",
+        "customer_impact": "BOOLEAN",
+        "expected_saving_per_year": "FLOAT",
+        "saving_currency": "VARCHAR(8)",
+        "actual_saving_first_year": "FLOAT",
+    },
+}
+
+
+def _ensure_table_columns(table_name, columns):
+    inspector = inspect(db.engine)
+    tables = inspector.get_table_names()
+    if table_name not in tables:
+        return
+    existing = {col["name"] for col in inspector.get_columns(table_name)}
+    for column_name, ddl in columns.items():
+        if column_name not in existing:
+            db.session.execute(
+                text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+            )
+
+
+def ensure_schema():
+    db.create_all()
+    for table, columns in SCHEMA_PATCHES.items():
+        _ensure_table_columns(table, columns)
+    db.session.commit()
+
+
+try:
+    with app.app_context():
+        ensure_schema()
+except Exception as exc:
+    app.logger.warning("Schema verification skipped: %s", exc)
 
 
 def _is_admin(user):

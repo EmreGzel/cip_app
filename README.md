@@ -78,6 +78,16 @@ and these users / Öffnen Sie `http://localhost:5000/initdb` nach dem ersten
 Start (oder wann immer Demodaten benötigt werden). Dadurch wird das SQLite-
 Schema zurückgesetzt und folgende Demo-Nutzer geladen:
 
+> **Heads-up / Hinweis:** The server now auto-checks the SQLite schema on
+> startup and adds missing columns (risk, savings, escalation, onboarding
+> fields, …) so older databases stop raising "no such column" errors. Existing
+> data stays untouched, but you can still call `/initdb` for a full refresh. /
+> **Info:** Der Server prüft beim Start automatisch das SQLite-Schema und fügt
+> fehlende Spalten (Risiko, Einsparungen, Eskalation, Onboarding, …) hinzu,
+> sodass ältere Datenbanken keine "no such column"-Fehler mehr auslösen. Die
+> bestehenden Daten bleiben unverändert; `/initdb` kann dennoch für einen
+> vollständigen Reset genutzt werden.
+
 - `admin` / `admin` (email `emre.guzel@fkt.com.tr` – approves registrations)
 - `alice` / `alice`
 - `bob` / `bob`
