@@ -48,18 +48,6 @@ WORKFLOW_STATUSES = [
 
 THEME_TYPES = ["CORRECTION", "OPTIMIZATION"]
 EFFECTIVENESS_STATUSES = ["UNKNOWN", "EFFECTIVE", "NOT_EFFECTIVE"]
-TASK_STATUS_LABELS = {
-    "OPEN": "Open / Offen",
-    "IN_PROGRESS": "In Progress / In Bearbeitung",
-    "DONE": "Done / Abgeschlossen",
-}
-TASK_STATUSES = list(TASK_STATUS_LABELS.keys())
-
-
-def bilingual(en_text, de_text):
-    """Return a combined English / German UI string."""
-
-    return f"{en_text} / {de_text}"
 
 
 class Role(db.Model):
@@ -176,43 +164,6 @@ class CIPMeasureHistory(db.Model):
     changed_by = db.relationship("User")
 
 
-class SystemLog(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    event_type = db.Column(db.String(64), nullable=False)
-    description = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
-    measure_id = db.Column(db.Integer, db.ForeignKey("cip_measure.id"))
-
-    user = db.relationship("User")
-    measure = db.relationship("CIPMeasure")
-
-
-class CIPTask(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    measure_id = db.Column(
-        db.Integer, db.ForeignKey("cip_measure.id"), nullable=False
-    )
-    title = db.Column(db.String(255), nullable=False)
-    description = db.Column(db.Text)
-    assigned_by_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    assigned_to_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    status = db.Column(db.String(32), default="OPEN", nullable=False)
-    response_note = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(
-        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
-
-    measure = db.relationship("CIPMeasure", backref=db.backref("tasks", lazy=True))
-    assigned_by = db.relationship(
-        "User", foreign_keys=[assigned_by_id], backref=db.backref("assigned_tasks", lazy=True)
-    )
-    assigned_to = db.relationship(
-        "User", foreign_keys=[assigned_to_id], backref=db.backref("incoming_tasks", lazy=True)
-    )
-
-
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -246,7 +197,7 @@ BASE_TEMPLATE = """
 <html lang=\"en\">
 <head>
     <meta charset=\"utf-8\">
-    <title>CIP / KVP Tracking System / CIP / KVP Nachverfolgungssystem</title>
+    <title>CIP / KVP Tool</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 1.5rem; background: #f7f7f7; }
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
@@ -270,22 +221,21 @@ BASE_TEMPLATE = """
 <body>
     <header>
         <div>
-            <strong>CIP / KVP Tracking System / CIP / KVP Nachverfolgungssystem</strong>
+            <strong>CIP / KVP Tool</strong>
             {% if current_user.is_authenticated %}
                 <span class=\"tag\">{{ current_user.role.name }}</span>
             {% endif %}
         </div>
         <nav>
             {% if current_user.is_authenticated %}
-                <a href=\"{{ url_for('dashboard') }}\">Dashboard / Übersicht</a>
-                <a href=\"{{ url_for('new_cip') }}\">New CIP / Neuer CIP</a>
+                <a href=\"{{ url_for('dashboard') }}\">Dashboard</a>
+                <a href=\"{{ url_for('new_cip') }}\">New CIP</a>
                 {% if current_user.role.name == 'ADMIN' %}
-                    <a href=\"{{ url_for('admin_panel') }}\">Admin / Verwaltung</a>
+                    <a href=\"{{ url_for('admin_panel') }}\">Admin</a>
                 {% endif %}
-                <a href=\"{{ url_for('view_logs') }}\">Logs / Protokolle</a>
-                <a href=\"{{ url_for('logout') }}\">Logout / Abmelden</a>
+                <a href=\"{{ url_for('logout') }}\">Logout</a>
             {% else %}
-                <a href=\"{{ url_for('login') }}\">Login / Anmelden</a>
+                <a href=\"{{ url_for('login') }}\">Login</a>
             {% endif %}
         </nav>
     </header>
@@ -307,7 +257,6 @@ BASE_TEMPLATE = """
 
 
 def render_page(body_template, **context):
-    context.setdefault("bilingual", bilingual)
     body = render_template_string(body_template, **context)
     return render_template_string(
         BASE_TEMPLATE,
@@ -315,9 +264,6 @@ def render_page(body_template, **context):
         current_user=current_user,
         WORKFLOW_STATUSES=WORKFLOW_STATUSES,
         EFFECTIVENESS_STATUSES=EFFECTIVENESS_STATUSES,
-        TASK_STATUSES=TASK_STATUSES,
-        TASK_STATUS_LABELS=TASK_STATUS_LABELS,
-        bilingual=bilingual,
         **context
     )
 
@@ -349,10 +295,7 @@ def init_db():
     ]
     db.session.add_all(demo_users)
     db.session.commit()
-    return (
-        bilingual("Database refreshed with demo data", "Datenbank mit Demodaten aktualisiert"),
-        200,
-    )
+    return "Database initialized with demo data", 200
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -364,21 +307,16 @@ def login():
         if user and user.password == password:
             login_user(user)
             return redirect(url_for("dashboard"))
-        flash(
-            bilingual(
-                "Invalid username or password",
-                "Ungültiger Benutzername oder Passwort",
-            )
-        )
+        flash("Invalid credentials")
     return render_page(
         """
-        <h1>Sign In / Anmeldung</h1>
+        <h1>Login</h1>
         <form method=\"post\">
-            <label>Username / Benutzername</label>
+            <label>Username</label>
             <input type=\"text\" name=\"username\" required>
-            <label>Password / Passwort</label>
+            <label>Password</label>
             <input type=\"password\" name=\"password\" required>
-            <button type=\"submit\">Login / Anmelden</button>
+            <button type=\"submit\">Login</button>
         </form>
         """
     )
@@ -410,17 +348,17 @@ def dashboard():
         )
     return render_page(
         """
-        <h1>Dashboard / Übersicht</h1>
-        <p>{{ measures|length }} CIP record(s) listed / {{ measures|length }} CIP-Datensätze angezeigt.</p>
+        <h1>Dashboard</h1>
+        <p>Showing {{ measures|length }} measure(s).</p>
         <table>
             <tr>
                 <th>No</th>
-                <th>Title / Titel</th>
-                <th>Status / Status</th>
-                <th>Priority / Priorität</th>
-                <th>Creator / Antragsteller</th>
-                <th>Responsible / Verantwortlicher</th>
-                <th>Created / Erstellt</th>
+                <th>Title</th>
+                <th>Status</th>
+                <th>Priority</th>
+                <th>Creator</th>
+                <th>Responsible</th>
+                <th>Created</th>
             </tr>
             {% for measure in measures %}
             <tr>
@@ -458,12 +396,7 @@ def new_cip():
         title = request.form.get("title", "").strip()
         description = request.form.get("problem_description", "").strip()
         if not title or not description:
-            flash(
-                bilingual(
-                    "Title and problem description are required",
-                    "Titel und Problembeschreibung sind erforderlich",
-                )
-            )
+            flash("Title and problem description are required")
         else:
             responsible_id = int(request.form.get("responsible_id"))
             priority_id = int(request.form.get("priority_id"))
@@ -494,82 +427,68 @@ def new_cip():
                 attention_list=attention_list,
             )
             db.session.add(measure)
-            db.session.flush()
-            record_log(
-                "CIP_OLUSTURMA",
-                bilingual(
-                    f"CIP #{measure.id} created",
-                    f"CIP #{measure.id} erstellt",
-                ),
-                measure,
-            )
             db.session.commit()
-            flash(
-                bilingual(
-                    f"CIP #{measure.id} created",
-                    f"CIP #{measure.id} erstellt",
-                )
-            )
+            flash(f"CIP #{measure.id} created")
             return redirect(url_for("view_cip", measure_id=measure.id))
     return render_page(
         """
-        <h1>New CIP Record / Neuer CIP-Datensatz</h1>
+        <h1>New CIP Measure</h1>
         <form method=\"post\">
-            <label>Title / Titel</label>
+            <label>Title</label>
             <input type=\"text\" name=\"title\" required>
-            <label>Problem Description / Problembeschreibung</label>
+            <label>Problem Description</label>
             <textarea name=\"problem_description\" rows=\"4\" required></textarea>
-            <label>Reporting Department / Meldende Abteilung</label>
+            <label>Reporting Department</label>
             <select name=\"reporting_department_id\">
                 <option value=\"\">-</option>
                 {% for d in departments %}
                     <option value=\"{{ d.id }}\">{{ d.name }}</option>
                 {% endfor %}
             </select>
-            <label>Responsible Department / Verantwortliche Abteilung</label>
+            <label>Responsible Department</label>
             <select name=\"responsible_department_id\">
                 <option value=\"\">-</option>
                 {% for d in departments %}
                     <option value=\"{{ d.id }}\">{{ d.name }}</option>
                 {% endfor %}
             </select>
-            <label>Category / Kategorie</label>
+            <label>Category</label>
             <select name=\"category_id\">
                 <option value=\"\">-</option>
                 {% for c in categories %}
                     <option value=\"{{ c.id }}\">{{ c.name }}</option>
                 {% endfor %}
             </select>
-            <label>Seat Type / Sitztyp</label>
+            <label>Seat Type</label>
             <select name=\"seat_type_id\">
                 <option value=\"\">-</option>
                 {% for s in seat_types %}
                     <option value=\"{{ s.id }}\">{{ s.name }}</option>
                 {% endfor %}
             </select>
-            <label>Priority / Priorität</label>
+            <label>Priority</label>
             <select name=\"priority_id\" required>
                 {% for p in priorities %}
                     <option value=\"{{ p.id }}\" {% if p.name == 'Medium' %}selected{% endif %}>{{ p.name }}</option>
                 {% endfor %}
             </select>
-            <label>Responsible User / Verantwortlicher Benutzer</label>
+            <label>Responsible User</label>
             <select name=\"responsible_id\" required>
                 {% for user in responsible_users %}
                     <option value=\"{{ user.id }}\">{{ user.username }}</option>
                 {% endfor %}
             </select>
-            <label>Theme Type / Thema-Art</label>
+            <label>Theme Type</label>
             <select name=\"theme_type\">
                 {% for t in theme_types %}
                     <option value=\"{{ t }}\">{{ t }}</option>
                 {% endfor %}
             </select>
-            <label>Root Cause / Grundursache</label>
+            <label>Root Cause</label>
             <textarea name=\"root_cause\" rows=\"3\"></textarea>
-            <label>Attention List (semicolon separated) / Verteilerliste (mit Semikolon)</label>
+            <label>Attention List (semicolon separated)</label>
             <input type=\"text\" name=\"attention_list\">
-            <button type=\"submit\">Create Record / Datensatz erstellen</button>
+            <button type=\"submit\">Create</button>
         </form>
         """,
         theme_types=THEME_TYPES,
@@ -586,35 +505,29 @@ def view_cip(measure_id):
         .order_by(CIPMeasureHistory.changed_at.desc())
         .all()
     )
-    tasks = (
-        CIPTask.query.filter_by(measure_id=measure.id)
-        .order_by(CIPTask.created_at.asc())
-        .all()
-    )
-    users = User.query.order_by(User.username).all()
     return render_page(
         """
         <h1>CIP #{{ measure.id }} - {{ measure.title }}</h1>
         <div class=\"flex\">
             <div class=\"card\">
-                <h3>Key Facts / Kerndaten</h3>
-                <p>Status / Status: <span class=\"status\">{{ measure.status }}</span></p>
-                <p>Priority / Priorität: {{ measure.priority.name if measure.priority else '-' }}</p>
-                <p>Creator / Antragsteller: {{ measure.creator.username }}</p>
-                <p>Responsible / Verantwortlicher: {{ measure.responsible.username }}</p>
-                <p>Created At / Erstellt am: {{ measure.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
-                <p>Reporting Department / Meldende Abteilung: {{ measure.reporting_department.name if measure.reporting_department else '-' }}</p>
-                <p>Responsible Department / Verantwortliche Abteilung: {{ measure.responsible_department.name if measure.responsible_department else '-' }}</p>
-                <p>Category / Kategorie: {{ measure.category.name if measure.category else '-' }}</p>
-                <p>Seat Type / Sitztyp: {{ measure.seat_type.name if measure.seat_type else '-' }}</p>
-                <p>Theme Type / Thema-Art: {{ measure.theme_type }}</p>
-                <p>Root Cause / Grundursache: {{ measure.root_cause or '-' }}</p>
-                <p>Attention List / Verteilerliste: {{ measure.attention_list or '-' }}</p>
+                <h3>Metadata</h3>
+                <p>Status: <span class=\"status\">{{ measure.status }}</span></p>
+                <p>Priority: {{ measure.priority.name if measure.priority else '-' }}</p>
+                <p>Creator: {{ measure.creator.username }}</p>
+                <p>Responsible: {{ measure.responsible.username }}</p>
+                <p>Created: {{ measure.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+                <p>Reporting Department: {{ measure.reporting_department.name if measure.reporting_department else '-' }}</p>
+                <p>Responsible Department: {{ measure.responsible_department.name if measure.responsible_department else '-' }}</p>
+                <p>Category: {{ measure.category.name if measure.category else '-' }}</p>
+                <p>Seat Type: {{ measure.seat_type.name if measure.seat_type else '-' }}</p>
+                <p>Theme Type: {{ measure.theme_type }}</p>
+                <p>Root Cause: {{ measure.root_cause or '-' }}</p>
+                <p>Attention: {{ measure.attention_list or '-' }}</p>
                 {% if measure.parent %}
-                    <p>Parent CIP / Übergeordnet: <a href=\"{{ url_for('view_cip', measure_id=measure.parent.id) }}\">#{{ measure.parent.id }}</a></p>
+                    <p>Parent Measure: <a href=\"{{ url_for('view_cip', measure_id=measure.parent.id) }}\">#{{ measure.parent.id }}</a></p>
                 {% endif %}
                 {% if measure.children %}
-                    <p>Follow-up CIP(s) / Folge-CIP(s):
+                    <p>Follow-up Measures:
                         {% for child in measure.children %}
                             <a href=\"{{ url_for('view_cip', measure_id=child.id) }}\">#{{ child.id }}</a>
                         {% endfor %}
@@ -622,29 +535,29 @@ def view_cip(measure_id):
                 {% endif %}
             </div>
             <div class=\"card\">
-                <h3>Problem & Comments / Problem & Kommentare</h3>
+                <h3>Problem Description</h3>
                 <p>{{ measure.problem_description }}</p>
                 {% if measure.comments %}
-                    <h4>Comments / Kommentare</h4>
+                    <h4>Comments</h4>
                     <p>{{ measure.comments }}</p>
                 {% endif %}
             </div>
             <div class=\"card\">
-                <h3>Action Plan / Maßnahmenplan</h3>
-                <p>Immediate action needed? / Sofortmaßnahme notwendig?: {{ 'Yes / Ja' if measure.sofort_needed else 'No / Nein' }}</p>
-                <p>Immediate action / Sofortmaßnahme: {{ measure.sofort_action or '-' }}</p>
-                <p>Planned corrective action / Geplante Korrekturmaßnahme: {{ measure.planned_action or '-' }}</p>
-                <p>Planned completion / Geplantes Ende: {{ measure.planned_due_date or '-' }}</p>
-                <p>Effectiveness check method / Wirksamkeitsprüfung Methode: {{ measure.effectiveness_check_method or '-' }}</p>
-                <p>Effectiveness check date / Wirksamkeitsprüfung Termin: {{ measure.effectiveness_check_date or '-' }}</p>
-                <p>Implemented action / Umgesetzte Maßnahme: {{ measure.implemented_action or '-' }}</p>
-                <p>Effectiveness status / Wirksamkeitsstatus: {{ measure.effectiveness_status }}</p>
-                <p>Effectiveness note / Wirksamkeitsnotiz: {{ measure.effectiveness_comment or '-' }}</p>
+                <h3>Action Plan</h3>
+                <p>Sofortmaßnahme notwendig: {{ 'Yes' if measure.sofort_needed else 'No' }}</p>
+                <p>Sofortmaßnahme: {{ measure.sofort_action or '-' }}</p>
+                <p>Geplante Maßnahme: {{ measure.planned_action or '-' }}</p>
+                <p>Geplanter Termin: {{ measure.planned_due_date or '-' }}</p>
+                <p>Wirksamkeit mittels: {{ measure.effectiveness_check_method or '-' }}</p>
+                <p>Beurteilungstermin: {{ measure.effectiveness_check_date or '-' }}</p>
+                <p>Umgesetzte Maßnahme: {{ measure.implemented_action or '-' }}</p>
+                <p>Wirksamkeit: {{ measure.effectiveness_status }}</p>
+                <p>Wirksamkeit Notu: {{ measure.effectiveness_comment or '-' }}</p>
             </div>
         </div>
-        <h2>Workflow History / Workflow-Historie</h2>
+        <h2>Workflow History</h2>
         <table>
-            <tr><th>From / Von</th><th>To / Nach</th><th>User / Benutzer</th><th>Date / Datum</th><th>Comment / Kommentar</th></tr>
+            <tr><th>From</th><th>To</th><th>User</th><th>Date</th><th>Comment</th></tr>
             {% for entry in history %}
                 <tr>
                     <td>{{ entry.from_status or '-' }}</td>
@@ -656,125 +569,69 @@ def view_cip(measure_id):
             {% endfor %}
         </table>
 
-        <h2>Tasks and Requests / Aufgaben und Anfragen</h2>
-        {% if tasks %}
-        <table>
-            <tr><th>Title / Titel</th><th>Requested By / Anfragender</th><th>Assignee / Zuständiger</th><th>Status / Status</th><th>Details / Details</th><th>Response / Antwort</th></tr>
-            {% for task in tasks %}
-                <tr>
-                    <td>{{ task.title }}</td>
-                    <td>{{ task.assigned_by.username }}</td>
-                    <td>{{ task.assigned_to.username }}</td>
-                    <td>{{ TASK_STATUS_LABELS.get(task.status, task.status) }}</td>
-                    <td>{{ task.description or '-' }}</td>
-                    <td>
-                        {% if task.response_note %}
-                            <p>{{ task.response_note }}</p>
-                        {% else %}
-                            <p>-</p>
-                        {% endif %}
-                        <small>Updated / Aktualisiert: {{ task.updated_at.strftime('%Y-%m-%d %H:%M') }}</small>
-                        {% if current_user.role.name == 'ADMIN' or current_user.id == task.assigned_to_id %}
-                            <form method=\"post\" action=\"{{ url_for('update_task_status', task_id=task.id) }}\">
-                                <label>Update Status / Status aktualisieren</label>
-                                <select name=\"status\" required>
-                                    {% for status in TASK_STATUSES %}
-                                        <option value=\"{{ status }}\" {% if task.status == status %}selected{% endif %}>{{ TASK_STATUS_LABELS.get(status, status) }}</option>
-                                    {% endfor %}
-                                </select>
-                                <label>Response / Antwort</label>
-                                <textarea name=\"response_note\" rows=\"2\"></textarea>
-                                <button type=\"submit\">Update / Aktualisieren</button>
-                            </form>
-                        {% endif %}
-                    </td>
-                </tr>
-            {% endfor %}
-        </table>
-        {% else %}
-            <p>No tasks or requests yet / Noch keine Aufgaben oder Anfragen vorhanden.</p>
-        {% endif %}
-
-        <h3>Create Task or Request / Aufgabe oder Anfrage erstellen</h3>
-        <form method=\"post\" action=\"{{ url_for('create_task', measure_id=measure.id) }}\">
-            <label>Title / Titel</label>
-            <input type=\"text\" name=\"title\" required>
-            <label>Details / Details</label>
-            <textarea name=\"description\" rows=\"3\"></textarea>
-            <label>Assignee / Zuständiger Benutzer</label>
-            <select name=\"assigned_to_id\" required>
-                {% for user in all_users %}
-                    <option value=\"{{ user.id }}\">{{ user.username }} ({{ user.role.name }})</option>
-                {% endfor %}
-            </select>
-            <button type=\"submit\">Assign Task / Aufgabe zuweisen</button>
-        </form>
-
         {% if current_user.role.name == 'CREATOR' and measure.creator_id == current_user.id and measure.status == 'DRAFT' %}
             <form method=\"post\" action=\"{{ url_for('report_cip', measure_id=measure.id) }}\">
-                <h3>Submit CIP Report / CIP melden</h3>
-                <button type=\"submit\">Report / Melden</button>
+                <h3>Report Measure</h3>
+                <button type=\"submit\">Report</button>
             </form>
         {% endif %}
 
         {% if current_user.role.name in ['RESPONSIBLE', 'ADMIN'] and measure.responsible_id == current_user.id and measure.status in ['REPORTED', 'SOLUTION_REJECTED'] %}
             <form method=\"post\" action=\"{{ url_for('propose_solution', measure_id=measure.id) }}\">
-                <h3>Propose Solution / Lösung vorschlagen</h3>
-                <label><input type=\"checkbox\" name=\"sofort_needed\" value=\"1\" {% if measure.sofort_needed %}checked{% endif %}> Immediate action required / Sofortmaßnahme notwendig</label>
-                <label>Immediate Action / Sofortmaßnahme</label>
+                <h3>Propose Solution</h3>
+                <label><input type=\"checkbox\" name=\"sofort_needed\" value=\"1\" {% if measure.sofort_needed %}checked{% endif %}> Sofortmaßnahme notwendig</label>
+                <label>Sofortmaßnahme</label>
                 <textarea name=\"sofort_action\" rows=\"3\">{{ measure.sofort_action or '' }}</textarea>
-                <label>Planned Corrective Action / Geplante Korrekturmaßnahme</label>
+                <label>Geplante Korrekturmaßnahme</label>
                 <textarea name=\"planned_action\" rows=\"3\">{{ measure.planned_action or '' }}</textarea>
-                <label>Planned Completion Date / Geplantes Enddatum</label>
+                <label>Geplanter Fertigungstermin</label>
                 <input type=\"date\" name=\"planned_due_date\" value=\"{{ measure.planned_due_date }}\">
-                <label>Effectiveness Check Method / Wirksamkeitsprüfung Methode</label>
+                <label>Prüfung der Wirksamkeit mittels</label>
                 <textarea name=\"effectiveness_check_method\" rows=\"3\">{{ measure.effectiveness_check_method or '' }}</textarea>
-                <label>Effectiveness Check Date / Wirksamkeitsprüfung Termin</label>
+                <label>Beurteilung der Wirksamkeit nach</label>
                 <input type=\"date\" name=\"effectiveness_check_date\" value=\"{{ measure.effectiveness_check_date }}\">
-                <button type=\"submit\">Submit Solution / Lösung senden</button>
+                <button type=\"submit\">Submit Solution</button>
             </form>
         {% endif %}
 
         {% if current_user.role.name == 'CREATOR' and measure.creator_id == current_user.id and measure.status == 'SOLUTION_PROPOSED' %}
             <form method=\"post\" action=\"{{ url_for('accept_solution', measure_id=measure.id) }}\">
-                <h3>Accept Solution / Lösung akzeptieren</h3>
-                <button type=\"submit\">Accept / Akzeptieren</button>
+                <h3>Accept Solution</h3>
+                <button type=\"submit\">Accept</button>
             </form>
             <form method=\"post\" action=\"{{ url_for('reject_solution', measure_id=measure.id) }}\">
-                <h3>Reject Solution / Lösung ablehnen</h3>
-                <label>Comment / Kommentar</label>
+                <h3>Reject Solution</h3>
+                <label>Comment</label>
                 <textarea name=\"comment\" rows=\"3\"></textarea>
-                <button type=\"submit\">Reject / Ablehnen</button>
+                <button type=\"submit\">Reject</button>
             </form>
         {% endif %}
 
         {% if current_user.role.name in ['RESPONSIBLE', 'ADMIN'] and measure.responsible_id == current_user.id and measure.status == 'SOLUTION_ACCEPTED' %}
             <form method=\"post\" action=\"{{ url_for('mark_implemented', measure_id=measure.id) }}\">
-                <h3>Mark as Implemented / Als umgesetzt markieren</h3>
-                <label>Implemented Action / Umgesetzte Maßnahme</label>
+                <h3>Mark as Implemented</h3>
+                <label>Implemented Action</label>
                 <textarea name=\"implemented_action\" rows=\"3\">{{ measure.implemented_action or '' }}</textarea>
-                <button type=\"submit\">Implemented / Umgesetzt</button>
+                <button type=\"submit\">Mark Implemented</button>
             </form>
         {% endif %}
 
         {% if current_user.role.name == 'CREATOR' and measure.creator_id == current_user.id and measure.status == 'IMPLEMENTED' %}
             <form method=\"post\" action=\"{{ url_for('evaluate_effectiveness', measure_id=measure.id) }}\">
-                <h3>Effectiveness Review / Wirksamkeitsbewertung</h3>
-                <label>Result / Ergebnis</label>
+                <h3>Effectiveness Check</h3>
+                <label>Result</label>
                 <select name=\"effectiveness_status\" required>
-                    <option value=\"EFFECTIVE\">Effective / Wirksam</option>
-                    <option value=\"NOT_EFFECTIVE\">Not Effective / Nicht wirksam</option>
+                    <option value=\"EFFECTIVE\">Wirksam</option>
+                    <option value=\"NOT_EFFECTIVE\">NICHT wirksam</option>
                 </select>
-                <label>Comment / Kommentar</label>
+                <label>Comment</label>
                 <textarea name=\"effectiveness_comment\" rows=\"3\"></textarea>
-                <button type=\"submit\">Save Evaluation / Bewertung speichern</button>
+                <button type=\"submit\">Submit Evaluation</button>
             </form>
         {% endif %}
         """,
         measure=measure,
         history=history,
-        tasks=tasks,
-        all_users=users,
     )
 
 
@@ -799,53 +656,20 @@ def _record_history(measure, new_status, comment=None):
     db.session.add(entry)
 
 
-def record_log(event_type, description, measure=None):
-    entry = SystemLog(
-        event_type=event_type,
-        description=description,
-        user_id=current_user.id if current_user.is_authenticated else None,
-        measure_id=measure.id if isinstance(measure, CIPMeasure) else measure,
-    )
-    db.session.add(entry)
-
-
 @app.post("/cip/<int:measure_id>/report")
 @login_required
 def report_cip(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     creator_required(measure)
     if measure.status != "DRAFT":
-        flash(
-            bilingual(
-                "This CIP has already been reported",
-                "Dieser CIP wurde bereits gemeldet",
-            )
-        )
+        flash("Measure already reported")
         return redirect(url_for("view_cip", measure_id=measure.id))
     if measure.theme_type == "CORRECTION" and not measure.root_cause:
-        flash(
-            bilingual(
-                "Root cause is required for CORRECTION",
-                "Eine Grundursache ist für CORRECTION erforderlich",
-            )
-        )
+        flash("Root cause is required for CORRECTION theme")
         return redirect(url_for("view_cip", measure_id=measure.id))
     _record_history(measure, "REPORTED")
-    record_log(
-        "CIP_RAPOR",
-        bilingual(
-            f"CIP #{measure.id} reported",
-            f"CIP #{measure.id} gemeldet",
-        ),
-        measure,
-    )
     db.session.commit()
-    flash(
-        bilingual(
-            "CIP reported",
-            "CIP gemeldet",
-        )
-    )
+    flash("Measure reported")
     return redirect(url_for("view_cip", measure_id=measure.id))
 
 
@@ -855,12 +679,7 @@ def propose_solution(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     responsible_required(measure)
     if measure.status not in ("REPORTED", "SOLUTION_REJECTED"):
-        flash(
-            bilingual(
-                "Solution proposal cannot be submitted in the current state",
-                "Lösungsvorschlag kann im aktuellen Status nicht eingereicht werden",
-            )
-        )
+        flash("Cannot propose solution in current state")
         return redirect(url_for("view_cip", measure_id=measure.id))
     measure.sofort_needed = bool(request.form.get("sofort_needed"))
     measure.sofort_action = request.form.get("sofort_action") or None
@@ -873,21 +692,8 @@ def propose_solution(measure_id):
         request.form.get("effectiveness_check_date")
     )
     _record_history(measure, "SOLUTION_PROPOSED")
-    record_log(
-        "COZUM_ONERISI",
-        bilingual(
-            f"{current_user.username} shared a solution for #{measure.id}",
-            f"{current_user.username} hat einen Lösungsvorschlag für #{measure.id} geteilt",
-        ),
-        measure,
-    )
     db.session.commit()
-    flash(
-        bilingual(
-            "Solution proposal submitted",
-            "Lösungsvorschlag eingereicht",
-        )
-    )
+    flash("Solution proposed")
     return redirect(url_for("view_cip", measure_id=measure.id))
 
 
@@ -897,29 +703,11 @@ def accept_solution(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     creator_required(measure)
     if measure.status != "SOLUTION_PROPOSED":
-        flash(
-            bilingual(
-                "Solution proposal is not in the expected state",
-                "Der Lösungsvorschlag befindet sich nicht im erwarteten Status",
-            )
-        )
+        flash("Solution not in proposed state")
         return redirect(url_for("view_cip", measure_id=measure.id))
     _record_history(measure, "SOLUTION_ACCEPTED")
-    record_log(
-        "COZUM_ONAY",
-        bilingual(
-            f"Solution for #{measure.id} accepted",
-            f"Lösung für #{measure.id} akzeptiert",
-        ),
-        measure,
-    )
     db.session.commit()
-    flash(
-        bilingual(
-            "Solution accepted",
-            "Lösung akzeptiert",
-        )
-    )
+    flash("Solution accepted")
     return redirect(url_for("view_cip", measure_id=measure.id))
 
 
@@ -929,33 +717,12 @@ def reject_solution(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     creator_required(measure)
     if measure.status != "SOLUTION_PROPOSED":
-        flash(
-            bilingual(
-                "Solution proposal is not in the expected state",
-                "Der Lösungsvorschlag befindet sich nicht im erwarteten Status",
-            )
-        )
+        flash("Solution not in proposed state")
         return redirect(url_for("view_cip", measure_id=measure.id))
-    comment = request.form.get("comment") or bilingual(
-        "Revision requested",
-        "Überarbeitung angefordert",
-    )
+    comment = request.form.get("comment") or "Revision requested"
     _record_history(measure, "SOLUTION_REJECTED", comment=comment)
-    record_log(
-        "COZUM_RED",
-        bilingual(
-            f"Solution for #{measure.id} rejected: {comment}",
-            f"Lösung für #{measure.id} abgelehnt: {comment}",
-        ),
-        measure,
-    )
     db.session.commit()
-    flash(
-        bilingual(
-            "Solution rejected",
-            "Lösung abgelehnt",
-        )
-    )
+    flash("Solution rejected")
     return redirect(url_for("view_cip", measure_id=measure.id))
 
 
@@ -965,39 +732,16 @@ def mark_implemented(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     responsible_required(measure)
     if measure.status != "SOLUTION_ACCEPTED":
-        flash(
-            bilingual(
-                "This CIP is not yet in implementation phase",
-                "Dieser CIP befindet sich noch nicht in der Umsetzungsphase",
-            )
-        )
+        flash("Measure is not ready for implementation")
         return redirect(url_for("view_cip", measure_id=measure.id))
     implemented_action = request.form.get("implemented_action", "").strip()
     if not implemented_action:
-        flash(
-            bilingual(
-                "Implemented action description is required",
-                "Beschreibung der umgesetzten Maßnahme ist erforderlich",
-            )
-        )
+        flash("Implemented action is required")
         return redirect(url_for("view_cip", measure_id=measure.id))
     measure.implemented_action = implemented_action
     _record_history(measure, "IMPLEMENTED")
-    record_log(
-        "UYGULAMA_TAMAM",
-        bilingual(
-            f"Implementation completed for #{measure.id}",
-            f"Umsetzung für #{measure.id} abgeschlossen",
-        ),
-        measure,
-    )
     db.session.commit()
-    flash(
-        bilingual(
-            "Implementation saved",
-            "Umsetzung gespeichert",
-        )
-    )
+    flash("Marked as implemented")
     return redirect(url_for("view_cip", measure_id=measure.id))
 
 
@@ -1007,74 +751,34 @@ def evaluate_effectiveness(measure_id):
     measure = CIPMeasure.query.get_or_404(measure_id)
     creator_required(measure)
     if measure.status != "IMPLEMENTED":
-        flash(
-            bilingual(
-                "Implementation must be completed before evaluation",
-                "Die Umsetzung muss vor der Bewertung abgeschlossen sein",
-            )
-        )
+        flash("Measure must be implemented before evaluation")
         return redirect(url_for("view_cip", measure_id=measure.id))
     status = request.form.get("effectiveness_status")
     comment = request.form.get("effectiveness_comment") or None
     if status not in ("EFFECTIVE", "NOT_EFFECTIVE"):
-        flash(
-            bilingual(
-                "Invalid effectiveness selection",
-                "Ungültige Wirksamkeitsauswahl",
-            )
-        )
+        flash("Invalid effectiveness choice")
         return redirect(url_for("view_cip", measure_id=measure.id))
     if status == "NOT_EFFECTIVE" and not comment:
-        flash(
-            bilingual(
-                "Comment is required when selecting not effective",
-                "Ein Kommentar ist erforderlich, wenn 'nicht wirksam' gewählt wird",
-            )
-        )
+        flash("Comment is required for NOT effective evaluation")
         return redirect(url_for("view_cip", measure_id=measure.id))
     measure.effectiveness_status = status
     measure.effectiveness_comment = comment
 
     if status == "EFFECTIVE":
-        _record_history(
-            measure,
-            "CLOSED_EFFECTIVE",
-            comment=bilingual("Found effective", "Als wirksam bewertet"),
-        )
-        record_log(
-            "CIP_ETKIN",
-            bilingual(
-                f"#{measure.id} closed as effective",
-                f"#{measure.id} als wirksam abgeschlossen",
-            ),
-            measure,
-        )
+        _record_history(measure, "CLOSED_EFFECTIVE", comment="Marked effective")
         db.session.commit()
-        flash(
-            bilingual(
-                "CIP closed as effective",
-                "CIP als wirksam abgeschlossen",
-            )
-        )
+        flash("Measure closed as effective")
         return redirect(url_for("view_cip", measure_id=measure.id))
 
     # NOT effective branch
     _record_history(
         measure,
         "CLOSED_NOT_EFFECTIVE",
-        comment=comment or bilingual("Not effective", "Nicht wirksam"),
-    )
-    record_log(
-        "CIP_ETKINSIZ",
-        bilingual(
-            f"#{measure.id} found not effective",
-            f"#{measure.id} als nicht wirksam bewertet",
-        ),
-        measure,
+        comment=comment or "Marked not effective",
     )
 
     follow_up = CIPMeasure(
-        title=f"Follow-up for CIP #{measure.id} / Folge für CIP #{measure.id}",
+        title=f"Follow-up for #{measure.id}",
         problem_description="",
         creator_id=measure.creator_id,
         responsible_id=measure.responsible_id,
@@ -1087,155 +791,9 @@ def evaluate_effectiveness(measure_id):
         parent=measure,
     )
     db.session.add(follow_up)
-    db.session.flush()
-    record_log(
-        "CIP_TAKIP",
-        bilingual(
-            f"#{measure.id} not effective, follow-up #{follow_up.id} created",
-            f"#{measure.id} nicht wirksam, Folge-CIP #{follow_up.id} erstellt",
-        ),
-        follow_up,
-    )
     db.session.commit()
-    flash(
-        bilingual(
-            f"CIP not effective. Follow-up #{follow_up.id} opened.",
-            f"CIP nicht wirksam. Folge-CIP #{follow_up.id} erstellt.",
-        )
-    )
+    flash(f"Measure closed as NOT effective. Follow-up #{follow_up.id} created.")
     return redirect(url_for("view_cip", measure_id=measure.id))
-
-
-@app.post("/cip/<int:measure_id>/tasks")
-@login_required
-def create_task(measure_id):
-    measure = CIPMeasure.query.get_or_404(measure_id)
-    title = request.form.get("title", "").strip()
-    assigned_to_id = request.form.get("assigned_to_id")
-    if not title or not assigned_to_id:
-        flash(
-            bilingual(
-                "Task title and assignee are required",
-                "Aufgabentitel und Zuständiger sind erforderlich",
-            )
-        )
-        return redirect(url_for("view_cip", measure_id=measure.id))
-    try:
-        assigned_to_id = int(assigned_to_id)
-    except (TypeError, ValueError):
-        flash(
-            bilingual(
-                "Invalid user selection",
-                "Ungültige Benutzerauswahl",
-            )
-        )
-        return redirect(url_for("view_cip", measure_id=measure.id))
-    assigned_to = User.query.get(assigned_to_id)
-    if not assigned_to:
-        flash(
-            bilingual(
-                "Selected user not found",
-                "Ausgewählter Benutzer nicht gefunden",
-            )
-        )
-        return redirect(url_for("view_cip", measure_id=measure.id))
-    task = CIPTask(
-        measure_id=measure.id,
-        title=title,
-        description=request.form.get("description") or None,
-        assigned_by_id=current_user.id,
-        assigned_to_id=assigned_to.id,
-    )
-    db.session.add(task)
-    db.session.flush()
-    record_log(
-        "GOREV_OLUSTUR",
-        bilingual(
-            f"Task #{task.id} for CIP #{measure.id} assigned to {assigned_to.username}",
-            f"Aufgabe #{task.id} für CIP #{measure.id} {assigned_to.username} zugewiesen",
-        ),
-        measure,
-    )
-    db.session.commit()
-    flash(
-        bilingual(
-            "Task created and shared with the assignee",
-            "Aufgabe erstellt und an den Zuständigen übermittelt",
-        )
-    )
-    return redirect(url_for("view_cip", measure_id=measure.id))
-
-
-@app.post("/tasks/<int:task_id>/status")
-@login_required
-def update_task_status(task_id):
-    task = CIPTask.query.get_or_404(task_id)
-    if current_user.role.name != "ADMIN" and task.assigned_to_id != current_user.id:
-        abort(403)
-    status = request.form.get("status")
-    if status not in TASK_STATUSES:
-        flash(
-            bilingual(
-                "Invalid task status selection",
-                "Ungültiger Aufgabestatus",
-            )
-        )
-        return redirect(url_for("view_cip", measure_id=task.measure_id))
-    task.status = status
-    response_note = request.form.get("response_note") or None
-    if response_note:
-        task.response_note = response_note
-    record_log(
-        "GOREV_GUNCELLE",
-        bilingual(
-            f"Task #{task.id} in CIP #{task.measure_id} updated to {status}",
-            f"Aufgabe #{task.id} in CIP #{task.measure_id} auf {status} aktualisiert",
-        ),
-        task.measure,
-    )
-    db.session.commit()
-    flash(
-        bilingual(
-            "Task updated",
-            "Aufgabe aktualisiert",
-        )
-    )
-    return redirect(url_for("view_cip", measure_id=task.measure_id))
-
-
-@app.route("/logs")
-@login_required
-def view_logs():
-    logs = (
-        SystemLog.query.order_by(SystemLog.created_at.desc())
-        .limit(200)
-        .all()
-    )
-    return render_page(
-        """
-        <h1>System Logs / Systemprotokolle</h1>
-        <p>Showing {{ logs|length }} recent entries / Anzeige der letzten {{ logs|length }} Protokolleinträge.</p>
-        <table>
-            <tr><th>Event / Ereignis</th><th>Description / Beschreibung</th><th>User / Benutzer</th><th>CIP</th><th>Date / Datum</th></tr>
-            {% for log in logs %}
-                <tr>
-                    <td>{{ log.event_type }}</td>
-                    <td>{{ log.description }}</td>
-                    <td>{{ log.user.username if log.user else '-' }}</td>
-                    <td>
-                        {% if log.measure_id %}
-                            <a href=\"{{ url_for('view_cip', measure_id=log.measure_id) }}\">#{{ log.measure_id }}</a>
-                        {% else %}
-                            -
-                        {% endif %}
-                    </td>
-                    <td>{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
-                </tr>
-            {% endfor %}
-        </table>
-        """,
-        logs=logs,
-    )
 
 
 @app.route("/admin")
@@ -1244,86 +802,60 @@ def view_logs():
 def admin_panel():
     return render_page(
         """
-        <h1>Admin Panel / Verwaltungsbereich</h1>
+        <h1>Admin Panel</h1>
         <ul>
-            <li><a href=\"{{ url_for('manage_users') }}\">Users / Benutzer</a></li>
-            <li><a href=\"{{ url_for('manage_departments') }}\">Departments / Abteilungen</a></li>
-            <li><a href=\"{{ url_for('manage_categories') }}\">Categories / Kategorien</a></li>
-            <li><a href=\"{{ url_for('manage_seat_types') }}\">Seat Types / Sitztypen</a></li>
-            <li><a href=\"{{ url_for('manage_priorities') }}\">Priorities / Prioritäten</a></li>
+            <li><a href=\"{{ url_for('manage_users') }}\">Users</a></li>
+            <li><a href=\"{{ url_for('manage_departments') }}\">Departments</a></li>
+            <li><a href=\"{{ url_for('manage_categories') }}\">Categories</a></li>
+            <li><a href=\"{{ url_for('manage_seat_types') }}\">Seat Types</a></li>
+            <li><a href=\"{{ url_for('manage_priorities') }}\">Priorities</a></li>
         </ul>
         """
     )
 
 
-def _generic_manage(model, title_en, title_de, endpoint, usage_check):
-    title_label = bilingual(title_en, title_de)
+def _generic_manage(model, title, endpoint, usage_check):
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         if name:
             if not model.query.filter_by(name=name).first():
                 db.session.add(model(name=name))
                 db.session.commit()
-                flash(
-                    bilingual(
-                        f"{title_en} entry added",
-                        f"{title_de}-Eintrag erstellt",
-                    )
-                )
+                flash(f"{title} added")
             else:
-                flash(
-                    bilingual(
-                        "Name already exists",
-                        "Name ist bereits vorhanden",
-                    )
-                )
+                flash("Name already exists")
         else:
-            flash(
-                bilingual(
-                    "Name is required",
-                    "Name ist erforderlich",
-                )
-            )
+            flash("Name is required")
     delete_id = request.args.get("delete")
     if delete_id:
         item = model.query.get(delete_id)
         if item:
             if usage_check(item):
-                flash(
-                    bilingual(
-                        "Cannot delete: record in use",
-                        "Löschen nicht möglich: Eintrag wird verwendet",
-                    )
-                )
+                flash("Cannot delete: value in use")
             else:
                 db.session.delete(item)
                 db.session.commit()
-                flash(
-                    bilingual(
-                        "Record deleted",
-                        "Eintrag gelöscht",
-                    )
-                )
+                flash("Deleted")
     items = model.query.order_by(model.name).all()
     return render_page(
         """
-        <h1>{{ title_label }} Admin</h1>
+        <h1>{{ title }} Management</h1>
         <form method=\"post\">
-            <label>Name / Name</label>
+            <label>Name</label>
             <input type=\"text\" name=\"name\" required>
-            <button type=\"submit\">Add / Hinzufügen</button>
+            <button type=\"submit\">Add</button>
         </form>
         <table>
-            <tr><th>Name / Name</th><th>Actions / Aktionen</th></tr>
+            <tr><th>Name</th><th>Actions</th></tr>
             {% for item in items %}
                 <tr>
                     <td>{{ item.name }}</td>
-                    <td><a href=\"{{ url_for(endpoint, delete=item.id) }}\">Delete / Löschen</a></td>
+                    <td><a href=\"{{ url_for(endpoint, delete=item.id) }}\">Delete</a></td>
                 </tr>
             {% endfor %}
         </table>
         """,
-        title_label=title_label,
+        title=title,
         items=items,
         endpoint=endpoint,
     )
@@ -1344,7 +876,7 @@ def manage_departments():
             > 0
         )
 
-    return _generic_manage(Department, "Department", "Abteilung", "manage_departments", usage_check)
+    return _generic_manage(Department, "Department", "manage_departments", usage_check)
 
 
 @app.route("/admin/categories", methods=["GET", "POST"])
@@ -1354,7 +886,7 @@ def manage_categories():
     def usage_check(category):
         return CIPMeasure.query.filter_by(category_id=category.id).count() > 0
 
-    return _generic_manage(Category, "Category", "Kategorie", "manage_categories", usage_check)
+    return _generic_manage(Category, "Category", "manage_categories", usage_check)
 
 
 @app.route("/admin/seat_types", methods=["GET", "POST"])
@@ -1364,7 +896,7 @@ def manage_seat_types():
     def usage_check(seat_type):
         return CIPMeasure.query.filter_by(seat_type_id=seat_type.id).count() > 0
 
-    return _generic_manage(SeatType, "Seat Type", "Sitztyp", "manage_seat_types", usage_check)
+    return _generic_manage(SeatType, "Seat Type", "manage_seat_types", usage_check)
 
 
 @app.route("/admin/priorities", methods=["GET", "POST"])
@@ -1374,7 +906,7 @@ def manage_priorities():
     def usage_check(priority):
         return CIPMeasure.query.filter_by(priority_id=priority.id).count() > 0
 
-    return _generic_manage(Priority, "Priority", "Priorität", "manage_priorities", usage_check)
+    return _generic_manage(Priority, "Priority", "manage_priorities", usage_check)
 
 
 @app.route("/admin/users", methods=["GET", "POST"])
@@ -1388,29 +920,14 @@ def manage_users():
             password = request.form.get("password", "")
             role_id = request.form.get("role_id")
             if not username or not password or not role_id:
-                flash(
-                    bilingual(
-                        "All fields are required",
-                        "Alle Felder sind erforderlich",
-                    )
-                )
+                flash("All fields are required")
             elif User.query.filter_by(username=username).first():
-                flash(
-                    bilingual(
-                        "Username already exists",
-                        "Benutzername existiert bereits",
-                    )
-                )
+                flash("Username already exists")
             else:
                 user = User(username=username, password=password, role_id=int(role_id))
                 db.session.add(user)
                 db.session.commit()
-                flash(
-                    bilingual(
-                        "User created",
-                        "Benutzer erstellt",
-                    )
-                )
+                flash("User created")
         elif action == "update":
             user_id = int(request.form.get("user_id"))
             user = User.query.get_or_404(user_id)
@@ -1421,55 +938,40 @@ def manage_users():
             if password:
                 user.password = password
             db.session.commit()
-            flash(
-                bilingual(
-                    "User updated",
-                    "Benutzer aktualisiert",
-                )
-            )
+            flash("User updated")
     delete_id = request.args.get("delete")
     if delete_id:
         user = User.query.get(delete_id)
         if user:
             if user.created_measures or user.responsible_measures:
-                flash(
-                    bilingual(
-                        "Cannot delete user referenced by CIP records",
-                        "Benutzer mit CIP-Verknüpfungen kann nicht gelöscht werden",
-                    )
-                )
+                flash("Cannot delete user referenced in measures")
             else:
                 db.session.delete(user)
                 db.session.commit()
-                flash(
-                    bilingual(
-                        "User deleted",
-                        "Benutzer gelöscht",
-                    )
-                )
+                flash("User deleted")
     users = User.query.order_by(User.username).all()
     roles = Role.query.order_by(Role.name).all()
     return render_page(
         """
-        <h1>User Management / Benutzerverwaltung</h1>
-        <h2>Create New User / Neuen Benutzer anlegen</h2>
+        <h1>User Management</h1>
+        <h2>Create User</h2>
         <form method=\"post\">
             <input type=\"hidden\" name=\"action\" value=\"create\">
-            <label>Username / Benutzername</label>
+            <label>Username</label>
             <input type=\"text\" name=\"username\" required>
-            <label>Password / Passwort</label>
+            <label>Password</label>
             <input type=\"password\" name=\"password\" required>
-            <label>Role / Rolle</label>
+            <label>Role</label>
             <select name=\"role_id\" required>
                 {% for role in roles %}
                     <option value=\"{{ role.id }}\">{{ role.name }}</option>
                 {% endfor %}
             </select>
-            <button type=\"submit\">Create / Erstellen</button>
+            <button type=\"submit\">Create</button>
         </form>
-        <h2>Existing Users / Bestehende Benutzer</h2>
+        <h2>Existing Users</h2>
         <table>
-            <tr><th>Username / Benutzername</th><th>Role / Rolle</th><th>Update / Aktualisieren</th><th>Delete / Löschen</th></tr>
+            <tr><th>Username</th><th>Role</th><th>Update</th><th>Delete</th></tr>
             {% for user in users %}
                 <tr>
                     <td>{{ user.username }}</td>
@@ -1478,20 +980,20 @@ def manage_users():
                         <form method=\"post\">
                             <input type=\"hidden\" name=\"action\" value=\"update\">
                             <input type=\"hidden\" name=\"user_id\" value=\"{{ user.id }}\">
-                            <label>Role / Rolle</label>
+                            <label>Role</label>
                             <select name=\"role_id\">
                                 {% for role in roles %}
                                     <option value=\"{{ role.id }}\" {% if role.id == user.role_id %}selected{% endif %}>{{ role.name }}</option>
                                 {% endfor %}
                             </select>
-                            <label>New Password / Neues Passwort</label>
-                            <input type=\"password\" name=\"password\" placeholder=\"Leave blank to keep / Leer lassen um zu behalten\">
-                            <button type=\"submit\">Update / Aktualisieren</button>
+                            <label>New Password</label>
+                            <input type=\"password\" name=\"password\" placeholder=\"Leave blank\">
+                            <button type=\"submit\">Update</button>
                         </form>
                     </td>
                     <td>
                         {% if user.username not in ['admin', 'alice', 'bob'] %}
-                            <a href=\"{{ url_for('manage_users', delete=user.id) }}\">Delete / Löschen</a>
+                            <a href=\"{{ url_for('manage_users', delete=user.id) }}\">Delete</a>
                         {% else %}
                             -
                         {% endif %}
@@ -1507,12 +1009,12 @@ def manage_users():
 
 @app.errorhandler(403)
 def forbidden(_):
-    return render_page("<h1>Access denied / Zugriff verweigert</h1>"), 403
+    return render_page("<h1>Forbidden</h1>", ), 403
 
 
 @app.errorhandler(404)
 def not_found(_):
-    return render_page("<h1>Page not found / Seite nicht gefunden</h1>"), 404
+    return render_page("<h1>Not Found</h1>"), 404
 
 
 with app.app_context():
